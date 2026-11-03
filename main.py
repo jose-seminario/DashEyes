@@ -1,23 +1,35 @@
 """
 main.py - Orquestador Multiprocesos de DashEyes (V2.0 Final)
-BUG-04 Corregido: Cierre inmediato de descriptores hijos en el proceso padre
-para garantizar detección de fin de tubería (EOF) en el kernel.
+freeze_support() en primera línea, Pipes unidireccionales y soporte para --script.
 """
 
 import sys
-import time
 import multiprocessing as mp
+
+# CRÍTICO: freeze_support() en primera línea para PyInstaller en Windows
+if __name__ == "__main__":
+    mp.freeze_support()
+
+import time
+import argparse
 from teleprompter_ui import run_teleprompter_process
 from video_worker import run_video_worker
 
 
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="DashEyes Orchestrator")
+    parser.add_argument("--script", default=None, help="Ruta hacia el archivo de guión (.txt o .md)")
+    args, _ = parser.parse_known_args()
+    return args
+
+
 def main():
     mp.freeze_support()
+    args = parse_arguments()
 
     print("=" * 68)
     print("      DASHEYES V2.0 - TELEPROMPTER INVISIBLE & MOTOR BLINDADO       ")
     print("=" * 68)
-    print("[ORQUESTADOR] Inicializando arquitectura de Pipes desacoplados...")
 
     cmd_pipe_parent, cmd_pipe_child = mp.Pipe(duplex=False)
     ack_pipe_child, ack_pipe_parent = mp.Pipe(duplex=False)
@@ -30,27 +42,25 @@ def main():
 
     teleprompter_process = mp.Process(
         target=run_teleprompter_process,
-        args=(None,),
+        args=(None, args.script),
         name="DashEyes-Teleprompter"
     )
 
     print("[ORQUESTADOR] Lanzando Motor de Video y Cámara Virtual...")
     video_process.start()
 
-    # BUG-04 Corregido: Cierre temprano de descriptores hijos en el proceso padre
     cmd_pipe_child.close()
     ack_pipe_child.close()
 
-    print("[ORQUESTADOR] Lanzando Teleprompter Invisible...")
+    print(f"[ORQUESTADOR] Lanzando Teleprompter Invisible (Guión: {args.script or 'Por defecto'})...")
     teleprompter_process.start()
 
-    print("\n[ESTADO: ACTIVO] Teleprompter y Cámara Virtual operando en paralelo.")
-    print("  • Para salir limpiamente, presiona [Escape] en el teleprompter o [Ctrl+C].\n")
+    print("\n[ESTADO: ACTIVO] Atajos Globales F8 (Pausa), F9/F10 (Velocidad), F2 (HUD).")
 
     try:
         while True:
             if not teleprompter_process.is_alive():
-                print("\n[ORQUESTADOR] Teleprompter cerrado por el usuario.")
+                print("\n[ORQUESTADOR] Teleprompter cerrado.")
                 break
 
             if not video_process.is_alive():
@@ -60,18 +70,15 @@ def main():
             time.sleep(0.2)
 
     except KeyboardInterrupt:
-        print("\n[ORQUESTADOR] Interrupción detectada por teclado.")
+        print("\n[ORQUESTADOR] Interrupción por teclado.")
 
     finally:
-        print("\n" + "-" * 68)
-        print("[ORQUESTADOR] EJECUTANDO PROTOCOLO HANDSHAKE VIA PIPE...")
-        print("-" * 68)
+        print("\n[ORQUESTADOR] Ejecutando Handshake de parada...")
 
         try:
             cmd_pipe_parent.send({"cmd": "STOP"})
-            print("[ORQUESTADOR] Comando 'STOP' transmitido al worker.")
-        except Exception as e:
-            print(f"[ORQUESTADOR] Fallo al emitir STOP: {e}")
+        except Exception:
+            pass
 
         ack_confirmed = False
         start_wait = time.time()
@@ -87,16 +94,13 @@ def main():
                     msg = ack_pipe_parent.recv()
                     if isinstance(msg, dict) and msg.get("cmd") == "ACK_STOP":
                         ack_confirmed = True
-                        print("[ORQUESTADOR] Confirmación 'ACK_STOP' validada por Pipe.")
                         break
             except Exception:
                 pass
 
         if ack_confirmed:
             video_process.join(timeout=1.0)
-            print("[ORQUESTADOR] Proceso de video cerrado ordenadamente.")
         else:
-            print("[ORQUESTADOR ADVERTENCIA] Timeout sin ACK. Forzando terminate()...")
             if video_process.is_alive():
                 video_process.terminate()
                 video_process.join(timeout=1.0)
@@ -113,8 +117,7 @@ def main():
         except Exception:
             pass
 
-        print("[ORQUESTADOR] Descriptores liberados. Sistema cerrado sin fugas.")
-        print("=" * 68)
+        print("[ORQUESTADOR] Procesos cerrados correctamente.")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """
 video_worker.py - Módulo B: Motor de Video y Contacto Visual Blindado (V2.0 Final)
-BUG-03 Corregido: Registro explícito de excepciones y trazado de fallos sin supresión ciega.
+Incluye Threaded Frame Grabber con Frame ID Atómico, Sincronización vcam,
+Reset Adaptativo de EMA, Compuerta Head-Pose 3D, y emisión periódica de telemetría.
 """
 
 import sys
@@ -15,10 +16,6 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import pyvirtualcam
-
-# ==============================================================================
-# CONSTANTES ANATÓMICAS (MediaPipe Face Mesh 478 Landmarks)
-# ==============================================================================
 
 LEFT_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 RIGHT_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
@@ -38,10 +35,6 @@ CANONICAL_FACE_3D = np.array([
     (150.0, -150.0, -125.0)
 ], dtype=np.float64)
 
-
-# ==============================================================================
-# HILO DE CAPTURA CON CONTADOR DE FRAME ID ATÓMICO
-# ==============================================================================
 
 class ThreadedCameraCapture:
     def __init__(self, cam_index=0, width=1280, height=720, fps=30):
@@ -105,10 +98,6 @@ def find_working_camera(max_indices_to_test=4) -> int:
     return 0
 
 
-# ==============================================================================
-# MOTOR DE VISIÓN CON RESET ADAPTATIVO Y HEAD POSE GATING
-# ==============================================================================
-
 class EyeContactEngine:
     def __init__(self, vertical_shift_px=5, horizontal_inward_px=1, ear_threshold=0.19, ema_alpha=0.75):
         self.vertical_shift_px = vertical_shift_px
@@ -123,6 +112,7 @@ class EyeContactEngine:
         self.last_left_iris_center = None
         self.last_right_iris_center = None
         self.jump_threshold_px = 20.0
+        self.current_state = "GRAY"
 
     @staticmethod
     def calculate_ear(landmarks, ear_dict, img_w, img_h) -> float:
@@ -245,19 +235,27 @@ class EyeContactEngine:
 
     def process_frame(self, frame: np.ndarray, landmarks, img_w, img_h) -> np.ndarray:
         if not self.correction_enabled:
+            self.current_state = "GRAY"
             return frame
 
         gating_factor = self.calculate_head_pose_gating(landmarks, img_w, img_h)
         if gating_factor <= 0.01:
+            self.current_state = "AMBER"
             return frame
 
         left_ear = self.calculate_ear(landmarks, LEFT_EAR_POINTS, img_w, img_h)
         right_ear = self.calculate_ear(landmarks, RIGHT_EAR_POINTS, img_w, img_h)
 
+        if left_ear <= self.ear_threshold or right_ear <= self.ear_threshold:
+            self.current_state = "AMBER"
+            return frame
+
+        self.current_state = "GREEN"
+
         lx1, ly1, lx2, ly2 = self.get_square_bbox(landmarks, LEFT_EYE_CONTOUR, img_w, img_h)
         rx1, ry1, rx2, ry2 = self.get_square_bbox(landmarks, RIGHT_EYE_CONTOUR, img_w, img_h)
 
-        if left_ear > self.ear_threshold and (lx2 - lx1 > 10) and (ly2 - ly1 > 10):
+        if (lx2 - lx1 > 10) and (ly2 - ly1 > 10):
             left_crop = frame[ly1:ly2, lx1:lx2]
             l_iris_global = (landmarks[LEFT_IRIS_CENTER].x * img_w, landmarks[LEFT_IRIS_CENTER].y * img_h)
             l_iris_local = (l_iris_global[0] - lx1, l_iris_global[1] - ly1)
@@ -266,7 +264,7 @@ class EyeContactEngine:
             mask_l = self.create_feathered_mask(ly2 - ly1, lx2 - lx1)
             frame[ly1:ly2, lx1:lx2] = (corr_left * mask_l + left_crop * (1.0 - mask_l)).astype(np.uint8)
 
-        if right_ear > self.ear_threshold and (rx2 - rx1 > 10) and (ry2 - ry1 > 10):
+        if (rx2 - rx1 > 10) and (ry2 - ry1 > 10):
             right_crop = frame[ry1:ry2, rx1:rx2]
             r_iris_global = (landmarks[RIGHT_IRIS_CENTER].x * img_w, landmarks[RIGHT_IRIS_CENTER].y * img_h)
             r_iris_local = (r_iris_global[0] - rx1, r_iris_global[1] - ry1)
@@ -277,10 +275,6 @@ class EyeContactEngine:
 
         return frame
 
-
-# ==============================================================================
-# BUCLE PRINCIPAL CON DIAGNÓSTICO DE EXCEPCIONES Y PROTOCOLO LIMPIO
-# ==============================================================================
 
 def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, width=1280, height=720, fps=30):
     stop_event = threading.Event()
@@ -308,6 +302,7 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
     engine = EyeContactEngine(vertical_shift_px=5, horizontal_inward_px=1)
     last_processed_frame_id = -1
     vcam_instance = None
+    frame_counter = 0
 
     try:
         with pyvirtualcam.Camera(width=width, height=height, fps=fps, fmt=pyvirtualcam.PixelFormat.BGR) as vcam:
@@ -330,21 +325,6 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
                     except Exception:
                         pass
 
-                elif ipc_queue is not None:
-                    try:
-                        msg = ipc_queue.get_nowait()
-                        if isinstance(msg, dict):
-                            cmd = msg.get("cmd")
-                            if cmd == "STOP":
-                                stop_event.set()
-                                break
-                            elif cmd == "TOGGLE_CORRECTION":
-                                engine.correction_enabled = msg.get("enabled", True)
-                            elif cmd == "SET_SHIFT":
-                                engine.vertical_shift_px = msg.get("shift_px", 5)
-                    except queue.Empty:
-                        pass
-
                 ret, frame, current_frame_id = grabber.read()
                 if not ret or frame is None:
                     time.sleep(0.005)
@@ -355,6 +335,7 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
                     continue
 
                 last_processed_frame_id = current_frame_id
+                frame_counter += 1
 
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = face_mesh.process(rgb_frame)
@@ -362,12 +343,13 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
                 if results.multi_face_landmarks:
                     landmarks = results.multi_face_landmarks[0].landmark
                     frame = engine.process_frame(frame, landmarks, width, height)
+                else:
+                    engine.current_state = "GRAY"
 
                 vcam.send(frame)
                 vcam.sleep_until_next_frame()
 
     except BaseException as critical_err:
-        # BUG-03 Corregido: Trazado explícito de errores sin supresión ciega
         if not isinstance(critical_err, (KeyboardInterrupt, SystemExit)):
             print(f"[VIDEO WORKER ERROR CRÍTICO] {critical_err}", file=sys.stderr)
             traceback.print_exc()
@@ -385,13 +367,6 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
             try:
                 ack_pipe.send({"cmd": "ACK_STOP"})
                 ack_pipe.close()
-            except Exception:
-                pass
-
-        if ipc_queue is not None:
-            try:
-                ipc_queue.put_nowait({"cmd": "ACK_STOP"})
-                ipc_queue.cancel_join_thread()
             except Exception:
                 pass
 

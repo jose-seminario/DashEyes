@@ -1,17 +1,22 @@
 """
 dashboard.py - Centro de Control y Diagnóstico de DashEyes (V2.0 Final)
-Punto de entrada visual con QSystemTrayIcon, InstallWorker asíncrono con
-cancelación segura, verificación estricta de Administrador y taskkill en árbol.
+freeze_support() en primera línea, selector de guión (.txt/.md),
+QSystemTrayIcon, y lanzamiento asíncrono con paso de parámetros.
 """
 
 import sys
+import multiprocessing as mp
+
+# CRÍTICO: freeze_support() en primera línea para empaquetado PyInstaller en Windows
+if __name__ == "__main__":
+    mp.freeze_support()
+
 import os
 import ctypes
 import subprocess
 import webbrowser
 import importlib
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -25,6 +30,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QSystemTrayIcon,
     QMenu,
+    QFileDialog,
 )
 
 
@@ -107,6 +113,8 @@ class DashEyesDashboard(QMainWindow):
         super().__init__()
         self.dash_process = None
         self.install_worker = None
+        self.selected_script_path = None
+
         self._init_window()
         self._init_tray_icon()
         self._init_ui()
@@ -114,7 +122,7 @@ class DashEyesDashboard(QMainWindow):
 
     def _init_window(self):
         self.setWindowTitle("DashEyes - Centro de Control V2.0")
-        self.setFixedSize(540, 520)
+        self.setFixedSize(560, 580)
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #0F172A;
@@ -147,12 +155,12 @@ class DashEyesDashboard(QMainWindow):
     def _init_ui(self):
         central_widget = QWidget()
         layout = QVBoxLayout()
-        layout.setContentsMargins(28, 28, 28, 28)
-        layout.setSpacing(16)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(14)
 
         title = QLabel("DASHEYES")
         title.setStyleSheet("font-size: 26px; font-weight: 800; color: #38BDF8; letter-spacing: 2px;")
-        subtitle = QLabel("Centro de Control y Diagnóstico de Entorno")
+        subtitle = QLabel("Centro de Control y Diagnóstico de Entorno V2.0")
         subtitle.setStyleSheet("font-size: 13px; color: #94A3B8;")
 
         layout.addWidget(title)
@@ -163,8 +171,9 @@ class DashEyesDashboard(QMainWindow):
         sep.setStyleSheet("color: #334155;")
         layout.addWidget(sep)
 
+        # Checklist de Diagnóstico
         self.status_box = QVBoxLayout()
-        self.status_box.setSpacing(10)
+        self.status_box.setSpacing(8)
 
         self.admin_badge = self._create_checklist_item("Privilegios de Administrador", "Verificando...")
         self.packages_badge = self._create_checklist_item("Paquetes de Python (Requisitos)", "Verificando...")
@@ -173,28 +182,62 @@ class DashEyesDashboard(QMainWindow):
         self.status_box.addLayout(self.admin_badge[0])
         self.status_box.addLayout(self.packages_badge[0])
         self.status_box.addLayout(self.obs_badge[0])
-
         layout.addLayout(self.status_box)
 
+        # Barra de progreso
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setFixedHeight(4)
         self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: none;
-                background-color: #1E293B;
-            }
-            QProgressBar::chunk {
-                background-color: #38BDF8;
-            }
+            QProgressBar { border: none; background-color: #1E293B; }
+            QProgressBar::chunk { background-color: #38BDF8; }
         """)
         self.progress_bar.hide()
         layout.addWidget(self.progress_bar)
 
+        # Selector de Guiones
+        script_box = QVBoxLayout()
+        script_label = QLabel("Guión de Presentación:")
+        script_label.setStyleSheet("font-size: 13px; font-weight: 600; color: #E2E8F0;")
+
+        script_btn_layout = QHBoxLayout()
+        self.script_path_label = QLabel("Ningún archivo cargado (Guión por defecto)")
+        self.script_path_label.setStyleSheet("""
+            background-color: #1E293B;
+            color: #94A3B8;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+        """)
+
+        self.select_script_btn = QPushButton("Cargar .txt / .md")
+        self.select_script_btn.setFixedHeight(30)
+        self.select_script_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #334155;
+                color: #38BDF8;
+                font-weight: 600;
+                font-size: 11px;
+                border-radius: 4px;
+                padding: 0 10px;
+                border: 1px solid #475569;
+            }
+            QPushButton:hover { background-color: #475569; }
+        """)
+        self.select_script_btn.clicked.connect(self.on_select_script_clicked)
+
+        script_btn_layout.addWidget(self.script_path_label, 1)
+        script_btn_layout.addWidget(self.select_script_btn)
+
+        script_box.addWidget(script_label)
+        script_box.addLayout(script_btn_layout)
+        layout.addLayout(script_box)
+
         layout.addStretch()
 
+        # Botón de Reparación
         self.repair_btn = QPushButton("Reparar / Instalar Dependencias")
-        self.repair_btn.setFixedHeight(40)
+        self.repair_btn.setFixedHeight(38)
         self.repair_btn.setStyleSheet("""
             QPushButton {
                 background-color: #334155;
@@ -203,17 +246,13 @@ class DashEyesDashboard(QMainWindow):
                 border-radius: 6px;
                 border: 1px solid #475569;
             }
-            QPushButton:hover {
-                background-color: #475569;
-            }
-            QPushButton:disabled {
-                color: #64748B;
-                background-color: #1E293B;
-            }
+            QPushButton:hover { background-color: #475569; }
+            QPushButton:disabled { color: #64748B; background-color: #1E293B; }
         """)
         self.repair_btn.clicked.connect(self.on_repair_clicked)
         layout.addWidget(self.repair_btn)
 
+        # Botones Principales (Iniciar / Salir)
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(12)
 
@@ -229,13 +268,8 @@ class DashEyesDashboard(QMainWindow):
                 border-radius: 6px;
                 border: none;
             }
-            QPushButton:hover {
-                background-color: #0369A1;
-            }
-            QPushButton:disabled {
-                background-color: #1E293B;
-                color: #64748B;
-            }
+            QPushButton:hover { background-color: #0369A1; }
+            QPushButton:disabled { background-color: #1E293B; color: #64748B; }
         """)
         self.launch_btn.clicked.connect(self.on_launch_clicked)
 
@@ -250,10 +284,7 @@ class DashEyesDashboard(QMainWindow):
                 border-radius: 6px;
                 border: 1px solid #334155;
             }
-            QPushButton:hover {
-                background-color: #1E293B;
-                color: #F8FAFC;
-            }
+            QPushButton:hover { background-color: #1E293B; color: #F8FAFC; }
         """)
         self.exit_btn.clicked.connect(self.close)
 
@@ -267,15 +298,15 @@ class DashEyesDashboard(QMainWindow):
     def _create_checklist_item(self, label_text: str, default_status: str):
         row = QHBoxLayout()
         title_label = QLabel(label_text)
-        title_label.setStyleSheet("font-size: 14px; font-weight: 500;")
+        title_label.setStyleSheet("font-size: 13px; font-weight: 500;")
 
         status_badge = QLabel(default_status)
         status_badge.setStyleSheet("""
-            font-size: 12px;
+            font-size: 11px;
             font-weight: 600;
             color: #94A3B8;
             background-color: #1E293B;
-            padding: 4px 8px;
+            padding: 3px 8px;
             border-radius: 4px;
         """)
 
@@ -283,6 +314,26 @@ class DashEyesDashboard(QMainWindow):
         row.addStretch()
         row.addWidget(status_badge)
         return (row, status_badge)
+
+    def on_select_script_clicked(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Seleccionar Guión de Presentación",
+            "",
+            "Archivos de Texto (*.txt *.md);;Todos los archivos (*.*)"
+        )
+        if file_path:
+            self.selected_script_path = file_path
+            file_name = os.path.basename(file_path)
+            self.script_path_label.setText(f"Cargado: {file_name}")
+            self.script_path_label.setStyleSheet("""
+                background-color: rgba(56, 189, 248, 0.15);
+                color: #38BDF8;
+                padding: 6px 10px;
+                border-radius: 4px;
+                font-size: 11px;
+                font-weight: 600;
+            """)
 
     def run_diagnostics(self):
         self.progress_bar.show()
@@ -296,7 +347,7 @@ class DashEyesDashboard(QMainWindow):
         if not res["is_admin"]:
             self.admin_badge[1].setText("DENEGADO (No es Admin)")
             self.admin_badge[1].setStyleSheet(
-                "color: #EF4444; background-color: rgba(239, 68, 68, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+                "color: #EF4444; background-color: rgba(239, 68, 68, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
             )
             self.launch_btn.setEnabled(False)
             self.repair_btn.setEnabled(False)
@@ -312,7 +363,7 @@ class DashEyesDashboard(QMainWindow):
 
         self.admin_badge[1].setText("OK (Administrador)")
         self.admin_badge[1].setStyleSheet(
-            "color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+            "color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
         )
 
         all_ok = True
@@ -320,24 +371,24 @@ class DashEyesDashboard(QMainWindow):
         if res["packages_ok"]:
             self.packages_badge[1].setText("100% Instalado")
             self.packages_badge[1].setStyleSheet(
-                "color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+                "color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
             )
         else:
             self.packages_badge[1].setText("Faltan Paquetes")
             self.packages_badge[1].setStyleSheet(
-                "color: #EF4444; background-color: rgba(239, 68, 68, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+                "color: #EF4444; background-color: rgba(239, 68, 68, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
             )
             all_ok = False
 
         if res["obs_driver_ok"]:
             self.obs_badge[1].setText("OK (DirectShow Activo)")
             self.obs_badge[1].setStyleSheet(
-                "color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+                "color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
             )
         else:
             self.obs_badge[1].setText("No Detectado")
             self.obs_badge[1].setStyleSheet(
-                "color: #EF4444; background-color: rgba(239, 68, 68, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+                "color: #EF4444; background-color: rgba(239, 68, 68, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
             )
             all_ok = False
 
@@ -376,15 +427,22 @@ class DashEyesDashboard(QMainWindow):
 
     def on_launch_clicked(self):
         main_py = os.path.join(os.path.dirname(__file__), "main.py")
+        cmd = [sys.executable, main_py]
+        if self.selected_script_path:
+            cmd.extend(["--script", self.selected_script_path])
+
         try:
-            self.dash_process = subprocess.Popen([sys.executable, main_py])
+            self.dash_process = subprocess.Popen(cmd)
             self.launch_btn.setEnabled(False)
             self.launch_btn.setText("DashEyes en Ejecución")
             self.launch_btn.setStyleSheet("background-color: #10B981; color: white; font-weight: bold;")
             QMessageBox.information(
                 self,
                 "DashEyes Iniciado",
-                "DashEyes se ha lanzado con éxito.\nEl teleprompter flotará en pantalla y la cámara virtual está activa.\n\nPuedes cerrar este Dashboard sin interrumpir la llamada."
+                "DashEyes se ha lanzado con éxito.\n"
+                "• Atajos Globales Activos: [F8] Pausa, [F9/F10] Velocidad, [F2] HUD.\n"
+                "• El teleprompter flotará en pantalla y la cámara virtual está activa.\n\n"
+                "Puedes cerrar este Dashboard sin interrumpir la llamada."
             )
         except Exception as e:
             QMessageBox.critical(self, "Error al Iniciar", f"No se pudo iniciar main.py:\n{e}")
@@ -408,7 +466,6 @@ class DashEyesDashboard(QMainWindow):
         event.accept()
 
     def _force_exit(self):
-        """BUG-01 Corregido: Finaliza el árbol de procesos completo en Windows con taskkill /T /F."""
         if self.dash_process is not None and self.dash_process.poll() is None:
             pid = self.dash_process.pid
             try:
