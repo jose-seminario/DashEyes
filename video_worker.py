@@ -1,7 +1,8 @@
 """
 video_worker.py - Módulo B: Motor de Video y Contacto Visual Blindado (V2.0 Engine)
 Incluye Threaded Frame Grabber con Frame ID Atómico, Sincronización vcam,
-Reset Adaptativo de EMA, Compuerta Head-Pose 3D y Protocolo Handshake (ACK).
+Reset Adaptativo de EMA, Compuerta Head-Pose 3D, soporte para Pipes IPC
+y blindaje de recursos DirectShow ante BaseException.
 """
 
 import sys
@@ -10,6 +11,7 @@ import queue
 import signal
 import threading
 from multiprocessing import Queue
+from multiprocessing.connection import Connection
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -28,7 +30,6 @@ RIGHT_EAR_POINTS = {'p1': 362, 'p4': 263, 'p2': 385, 'p6': 380, 'p3': 387, 'p5':
 LEFT_IRIS_CENTER = 468
 RIGHT_IRIS_CENTER = 473
 
-# Modelo antropométrico 3D canónico de la cabeza humana para Head Pose PnP
 CANONICAL_FACE_3D = np.array([
     (0.0, 0.0, 0.0),             # Punta de la nariz (Landmark 1)
     (0.0, -330.0, -65.0),        # Barbilla (Landmark 152)
@@ -44,11 +45,6 @@ CANONICAL_FACE_3D = np.array([
 # ==============================================================================
 
 class ThreadedCameraCapture:
-    """
-    Hilo en segundo plano que lee continuamente de cv2.VideoCapture.
-    Incrementa 'frame_id' cada vez que el sensor hardware entrega un fotograma nuevo,
-    evitando que la CPU procese cuadros duplicados innecesariamente.
-    """
     def __init__(self, cam_index=0, width=1280, height=720, fps=30):
         self.cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
         if not self.cap.isOpened():
@@ -62,9 +58,8 @@ class ThreadedCameraCapture:
         self.stopped = False
         self.latest_frame = None
         self.ret = False
-        self.frame_id = 0  # Contador de fotogramas físicos leídos
+        self.frame_id = 0
 
-        # Leer primer fotograma para validar disponibilidad
         self.ret, self.latest_frame = self.cap.read()
         if self.ret:
             self.frame_id = 1
@@ -84,7 +79,6 @@ class ThreadedCameraCapture:
                 time.sleep(0.005)
 
     def read(self):
-        """Devuelve (disponible, fotograma_copia, frame_id_actual)."""
         with self.lock:
             if self.latest_frame is None or not self.ret:
                 return False, None, self.frame_id
@@ -99,8 +93,6 @@ class ThreadedCameraCapture:
 
 
 def find_working_camera(max_indices_to_test=4) -> int:
-    """Escanea índices de cámara (0..N) y devuelve el primer dispositivo accesible."""
-    print("[HARDWARE] Escaneando cámaras web disponibles...")
     for idx in range(max_indices_to_test):
         test_cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
         if not test_cap.isOpened():
@@ -110,10 +102,7 @@ def find_working_camera(max_indices_to_test=4) -> int:
             ret, _ = test_cap.read()
             test_cap.release()
             if ret:
-                print(f"[HARDWARE] Cámara detectada y operativa en índice {idx}.")
                 return idx
-
-    print("[HARDWARE ADVERTENCIA] No se detectó ninguna cámara activa. Reintentando índice 0.")
     return 0
 
 
@@ -129,11 +118,9 @@ class EyeContactEngine:
         self.ema_alpha = ema_alpha
         self.correction_enabled = True
 
-        # Memoria EMA
         self.prev_left_offset = np.array([0.0, 0.0], dtype=np.float32)
         self.prev_right_offset = np.array([0.0, 0.0], dtype=np.float32)
 
-        # Memoria para Reset Adaptativo (Anti-Gelatina)
         self.last_left_iris_center = None
         self.last_right_iris_center = None
         self.jump_threshold_px = 20.0
@@ -157,14 +144,13 @@ class EyeContactEngine:
 
     @staticmethod
     def calculate_head_pose_gating(landmarks, img_w, img_h) -> float:
-        """Calcula atenuación entre 1.0 (frontal) y 0.0 (rotación > 20 grados)."""
         image_points = np.array([
-            (landmarks[1].x * img_w, landmarks[1].y * img_h),       # Nariz
-            (landmarks[152].x * img_w, landmarks[152].y * img_h),   # Barbilla
-            (landmarks[33].x * img_w, landmarks[33].y * img_h),     # Ojo izq
-            (landmarks[263].x * img_w, landmarks[263].y * img_h),   # Ojo der
-            (landmarks[61].x * img_w, landmarks[61].y * img_h),     # Boca izq
-            (landmarks[291].x * img_w, landmarks[291].y * img_h)    # Boca der
+            (landmarks[1].x * img_w, landmarks[1].y * img_h),
+            (landmarks[152].x * img_w, landmarks[152].y * img_h),
+            (landmarks[33].x * img_w, landmarks[33].y * img_h),
+            (landmarks[263].x * img_w, landmarks[263].y * img_h),
+            (landmarks[61].x * img_w, landmarks[61].y * img_h),
+            (landmarks[291].x * img_w, landmarks[291].y * img_h)
         ], dtype=np.float64)
 
         focal_length = img_w
@@ -228,7 +214,6 @@ class EyeContactEngine:
         dy = (-self.vertical_shift_px) * gating_factor
         raw_offset = np.array([dx, dy], dtype=np.float32)
 
-        # Reset Adaptativo del EMA si el ojo saltó más de 20px
         last_center = self.last_left_iris_center if is_left else self.last_right_iris_center
         current_center = np.array(iris_center_global, dtype=np.float32)
 
@@ -295,10 +280,10 @@ class EyeContactEngine:
 
 
 # ==============================================================================
-# BUCLE PRINCIPAL CON COMPARACIÓN DE FRAME ID Y SINCRONIZACIÓN VCAM
+# BUCLE PRINCIPAL CON PROTECCIÓN ANTE BaseException Y SOPORTE PIPES
 # ==============================================================================
 
-def run_video_worker(ipc_queue: Queue = None, width=1280, height=720, fps=30):
+def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, width=1280, height=720, fps=30):
     stop_event = threading.Event()
 
     def signal_handler(signum, frame):
@@ -322,23 +307,38 @@ def run_video_worker(ipc_queue: Queue = None, width=1280, height=720, fps=30):
     )
 
     engine = EyeContactEngine(vertical_shift_px=5, horizontal_inward_px=1)
-
-    print(f"[VIDEO WORKER V2] Conectando a pyvirtualcam ({width}x{height} @ {fps} FPS)...")
     last_processed_frame_id = -1
+    vcam_instance = None
 
     try:
         with pyvirtualcam.Camera(width=width, height=height, fps=fps, fmt=pyvirtualcam.PixelFormat.BGR) as vcam:
-            print(f"[VIDEO WORKER V2] Cámara virtual activa: {vcam.device}")
-            print("[VIDEO WORKER V2] Pipeline sincronizado a 30 FPS con control de frame_id.\n")
+            vcam_instance = vcam
 
             while not stop_event.is_set():
-                if ipc_queue is not None:
+                # 1. Comprobación por Pipe (Unidireccional Directo - Recomendado)
+                if cmd_pipe is not None:
+                    try:
+                        if cmd_pipe.poll():
+                            msg = cmd_pipe.recv()
+                            if isinstance(msg, dict):
+                                cmd = msg.get("cmd")
+                                if cmd == "STOP":
+                                    stop_event.set()
+                                    break
+                                elif cmd == "TOGGLE_CORRECTION":
+                                    engine.correction_enabled = msg.get("enabled", True)
+                                elif cmd == "SET_SHIFT":
+                                    engine.vertical_shift_px = msg.get("shift_px", 5)
+                    except Exception:
+                        pass
+
+                # 2. Comprobación retrocompatible por Queue
+                elif ipc_queue is not None:
                     try:
                         msg = ipc_queue.get_nowait()
                         if isinstance(msg, dict):
                             cmd = msg.get("cmd")
                             if cmd == "STOP":
-                                print("[VIDEO WORKER V2] Señal STOP recibida. Liberando...")
                                 stop_event.set()
                                 break
                             elif cmd == "TOGGLE_CORRECTION":
@@ -353,9 +353,8 @@ def run_video_worker(ipc_queue: Queue = None, width=1280, height=720, fps=30):
                     time.sleep(0.005)
                     continue
 
-                # CONTROL DE CPU: Solo procesar si el sensor hardware entregó un frame nuevo
                 if current_frame_id == last_processed_frame_id:
-                    time.sleep(0.001)  # Ceder ciclo de CPU al sistema operativo
+                    time.sleep(0.001)
                     continue
 
                 last_processed_frame_id = current_frame_id
@@ -368,25 +367,35 @@ def run_video_worker(ipc_queue: Queue = None, width=1280, height=720, fps=30):
                     frame = engine.process_frame(frame, landmarks, width, height)
 
                 vcam.send(frame)
-                # Sincronización exacta con el reloj nominal del driver virtual de Windows
                 vcam.sleep_until_next_frame()
 
-    except KeyboardInterrupt:
-        print("\n[VIDEO WORKER V2] Interrupción por teclado.")
-    except Exception as e:
-        print(f"\n[VIDEO WORKER V2 ERROR] {e}")
+    except BaseException as critical_err:
+        pass
+
     finally:
-        print("[VIDEO WORKER V2] Deteniendo grabber y liberando cámara...")
+        # Desmontaje atómico blindado de hardware y descriptores
         grabber.stop()
         face_mesh.close()
+        if vcam_instance is not None:
+            try:
+                vcam_instance.close()
+            except Exception:
+                pass
+
+        # Notificación Handshake ACK al orquestador
+        if ack_pipe is not None:
+            try:
+                ack_pipe.send({"cmd": "ACK_STOP"})
+                ack_pipe.close()
+            except Exception:
+                pass
 
         if ipc_queue is not None:
             try:
                 ipc_queue.put_nowait({"cmd": "ACK_STOP"})
-                print("[VIDEO WORKER V2] Handshake 'ACK_STOP' emitido a main.py.")
+                ipc_queue.cancel_join_thread()
             except Exception:
                 pass
-        print("[VIDEO WORKER V2] Driver y descriptores de hardware liberados limpiamente.")
 
 
 if __name__ == "__main__":

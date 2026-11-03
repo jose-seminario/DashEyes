@@ -1,85 +1,79 @@
 """
 main.py - Orquestador Multiprocesos de DashEyes (V2.0 Engine)
-Incluye Handshake Bidireccional de Cierre Seguro (ACK_STOP) y protección
-del driver DirectShow de Windows para evitar bloqueos en memoria.
+Incluye arquitectura de comunicación con Pipes Unidireccionales,
+Handshake ACK_STOP y protección de kernel para DirectShow.
 """
 
 import sys
 import time
-import queue
 import multiprocessing as mp
 from teleprompter_ui import run_teleprompter_process
 from video_worker import run_video_worker
 
 
 def main():
-    # Inicialización limpia en Windows (soporte multiprocessing spawn)
     mp.freeze_support()
 
     print("=" * 68)
     print("      DASHEYES V2.0 - TELEPROMPTER INVISIBLE & MOTOR BLINDADO       ")
     print("=" * 68)
-    print("[ORQUESTADOR] Inicializando cola IPC y arquitectura multiprocesos...")
+    print("[ORQUESTADOR] Inicializando arquitectura de Pipes desacoplados...")
 
-    # Cola de mensajería Inter-Procesos bidireccional
-    ipc_queue = mp.Queue()
+    # Canales de comunicación unidireccionales (Kernel Pipes)
+    cmd_pipe_parent, cmd_pipe_child = mp.Pipe(duplex=False)
+    ack_pipe_child, ack_pipe_parent = mp.Pipe(duplex=False)
 
-    # 1. Proceso 2: Motor de Video Blindado (Captura Threaded + MediaPipe + VirtualCam)
+    # 1. Proceso 2: Motor de Video
     video_process = mp.Process(
         target=run_video_worker,
-        args=(ipc_queue,),
+        args=(cmd_pipe_child, ack_pipe_child, None),
         name="DashEyes-VideoWorker"
     )
 
-    # 2. Proceso 1: Teleprompter Invisible (PyQt6 + WDA_EXCLUDEFROMCAPTURE)
+    # 2. Proceso 1: Teleprompter Invisible
     teleprompter_process = mp.Process(
         target=run_teleprompter_process,
-        args=(ipc_queue,),
+        args=(None,),
         name="DashEyes-Teleprompter"
     )
 
-    print("[ORQUESTADOR] Lanzando Motor de Video en segundo plano...")
+    print("[ORQUESTADOR] Lanzando Motor de Video y Cámara Virtual...")
     video_process.start()
 
-    print("[ORQUESTADOR] Lanzando Teleprompter Invisible (UI)...")
+    print("[ORQUESTADOR] Lanzando Teleprompter Invisible...")
     teleprompter_process.start()
 
-    print("\n[ESTADO: ACTIVO] Ambos procesos operan en paralelo.")
-    print("  • Teleprompter invisible a capturas de Zoom/Teams/OBS.")
-    print("  • Motor de video con Threaded Grabber a 30 FPS estables.")
-    print("  • Para salir de forma segura, presiona [Escape] en el teleprompter o [Ctrl+C] en la terminal.\n")
+    print("\n[ESTADO: ACTIVO] Teleprompter y Cámara Virtual operando en paralelo.")
+    print("  • Para salir limpiamente, presiona [Escape] en el teleprompter o [Ctrl+C].\n")
 
-    # Bucle de supervisión del ciclo de vida
     try:
         while True:
-            # Monitoreo prioritario: Si el usuario cierra el teleprompter (Esc o botón cerrar)
             if not teleprompter_process.is_alive():
                 print("\n[ORQUESTADOR] Teleprompter cerrado por el usuario.")
                 break
 
-            # Si el proceso de video falla inesperadamente
             if not video_process.is_alive():
-                print("\n[ORQUESTADOR] El proceso de video ha terminado inesperadamente.")
+                print("\n[ORQUESTADOR] El proceso de video ha terminado.")
                 break
 
             time.sleep(0.2)
 
     except KeyboardInterrupt:
-        print("\n[ORQUESTADOR] Interrupción manual por teclado detectada.")
+        print("\n[ORQUESTADOR] Interrupción detectada por teclado.")
 
     finally:
         print("\n" + "-" * 68)
-        print("[ORQUESTADOR] INICIANDO PROTOCOLO DE CIERRE SEGURO (HANDSHAKE)...")
+        print("[ORQUESTADOR] EJECUTANDO PROTOCOLO HANDSHAKE VIA PIPE...")
         print("-" * 68)
 
-        # 1. Notificar al Video Worker mediante comando STOP
+        # 1. Enviar STOP por el Pipe de comando
         try:
-            ipc_queue.put_nowait({"cmd": "STOP"})
-            print("[ORQUESTADOR] Comando 'STOP' enviado al worker de video.")
+            cmd_pipe_parent.send({"cmd": "STOP"})
+            print("[ORQUESTADOR] Comando 'STOP' transmitido al worker.")
         except Exception as e:
-            print(f"[ORQUESTADOR] Error al emitir STOP: {e}")
+            print(f"[ORQUESTADOR] Fallo al emitir STOP: {e}")
 
-        # 2. Esperar confirmación Handshake (ACK_STOP) durante una ventana de hasta 3 segundos
+        # 2. Esperar confirmación ACK_STOP en el Pipe de confirmación
         ack_confirmed = False
         start_wait = time.time()
         timeout_sec = 3.0
@@ -87,43 +81,44 @@ def main():
         while time.time() - start_wait < timeout_sec:
             if not video_process.is_alive():
                 ack_confirmed = True
-                print("[ORQUESTADOR] El worker de video ya ha cerrado sus descriptores.")
                 break
 
             try:
-                msg = ipc_queue.get_nowait()
-                if isinstance(msg, dict) and msg.get("cmd") == "ACK_STOP":
-                    ack_confirmed = True
-                    print("[ORQUESTADOR] Confirmación 'ACK_STOP' recibida: Hardware y driver liberados.")
-                    break
-            except queue.Empty:
-                time.sleep(0.05)
+                if ack_pipe_parent.poll(timeout=0.05):
+                    msg = ack_pipe_parent.recv()
+                    if isinstance(msg, dict) and msg.get("cmd") == "ACK_STOP":
+                        ack_confirmed = True
+                        print("[ORQUESTADOR] Confirmación 'ACK_STOP' validada por Pipe.")
+                        break
+            except Exception:
+                pass
 
-        # 3. Proceder al join o forzar terminación solo si no hubo respuesta
         if ack_confirmed:
             video_process.join(timeout=1.0)
-            print("[ORQUESTADOR] Proceso de video cerrado limpiamente.")
+            print("[ORQUESTADOR] Proceso de video cerrado ordenadamente.")
         else:
-            print("[ORQUESTADOR ADVERTENCIA] Timeout de 3s agotado sin ACK. Forzando terminate()...")
+            print("[ORQUESTADOR ADVERTENCIA] Timeout sin ACK. Forzando terminate()...")
             if video_process.is_alive():
                 video_process.terminate()
                 video_process.join(timeout=1.0)
 
-        # 4. Asegurar terminación del teleprompter
+        # 3. Finalizar Teleprompter
         if teleprompter_process.is_alive():
             teleprompter_process.join(timeout=1.5)
             if teleprompter_process.is_alive():
                 teleprompter_process.terminate()
                 teleprompter_process.join(timeout=0.5)
 
-        # 5. Cerrar de forma segura la cola IPC
+        # 4. Cerrar descriptores de los Pipes en el proceso padre
         try:
-            ipc_queue.close()
-            ipc_queue.join_thread()
+            cmd_pipe_parent.close()
+            cmd_pipe_child.close()
+            ack_pipe_parent.close()
+            ack_pipe_child.close()
         except Exception:
             pass
 
-        print("[ORQUESTADOR] Driver DirectShow y procesos cerrados sin riesgo de bloqueo.")
+        print("[ORQUESTADOR] Descriptores liberados. Sistema cerrado sin fugas.")
         print("=" * 68)
 
 

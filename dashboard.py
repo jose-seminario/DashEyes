@@ -1,7 +1,7 @@
 """
 dashboard.py - Centro de Control y Diagnóstico de DashEyes (V2.0)
-Punto de entrada visual para verificación estricta de administrador, diagnóstico de hardware
-y dependencias, autoreparación asíncrona (sin UI freeze) e inicio orquestado.
+Punto de entrada visual con QSystemTrayIcon, InstallWorker asíncrono con
+cancelación segura, y verificación estricta de Administrador.
 """
 
 import sys
@@ -11,6 +11,7 @@ import subprocess
 import webbrowser
 import importlib
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -22,11 +23,12 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QMessageBox,
     QFrame,
+    QSystemTrayIcon,
+    QMenu,
 )
 
 
 class DiagnosticWorker(QThread):
-    """Hilo de diagnóstico en segundo plano para no congelar la UI al testear hardware."""
     diagnostics_complete = pyqtSignal(dict)
 
     def run(self):
@@ -38,13 +40,11 @@ class DiagnosticWorker(QThread):
             "is_admin": False
         }
 
-        # 1. Verificación de Administrador
         try:
             results["is_admin"] = bool(ctypes.windll.shell32.IsUserAnAdmin() != 0)
         except Exception:
             results["is_admin"] = False
 
-        # 2. Verificación de Paquetes Python
         required_modules = ["PyQt6", "cv2", "mediapipe", "pyvirtualcam", "numpy"]
         for mod in required_modules:
             try:
@@ -54,7 +54,6 @@ class DiagnosticWorker(QThread):
                 results["packages_details"].append((mod, False, "Faltante"))
                 results["packages_ok"] = False
 
-        # 3. Verificación del Driver OBS Virtual Camera (DirectShow)
         try:
             import pyvirtualcam
             with pyvirtualcam.Camera(width=640, height=480, fps=30) as cam:
@@ -68,28 +67,39 @@ class DiagnosticWorker(QThread):
 
 
 class InstallWorker(QThread):
-    """Ejecuta la instalación de pip en segundo plano con notificación por señales."""
     install_finished = pyqtSignal(bool, str)
 
     def __init__(self, requirements_path: str):
         super().__init__()
         self.requirements_path = requirements_path
+        self.process = None
 
     def run(self):
         try:
             cmd = [sys.executable, "-m", "pip", "install", "-r", self.requirements_path]
-            proc = subprocess.run(
+            self.process = subprocess.Popen(
                 cmd,
-                capture_output=True,
-                text=True,
-                check=True
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
             )
-            self.install_finished.emit(True, "Dependencias instaladas correctamente.")
-        except subprocess.CalledProcessError as e:
-            err_msg = e.stderr if e.stderr else e.stdout
-            self.install_finished.emit(False, f"Fallo en pip install:\n{err_msg}")
+
+            while self.process.poll() is None:
+                if self.isInterruptionRequested():
+                    self.process.terminate()
+                    self.process.wait(timeout=2.0)
+                    self.install_finished.emit(False, "Instalación cancelada por el usuario.")
+                    return
+                self.msleep(100)
+
+            stdout, stderr = self.process.communicate()
+            if self.process.returncode == 0:
+                self.install_finished.emit(True, "Dependencias instaladas correctamente.")
+            else:
+                self.install_finished.emit(False, f"Fallo en pip:\n{stderr or stdout}")
+
         except Exception as ex:
-            self.install_finished.emit(False, f"Excepción al ejecutar el instalador:\n{str(ex)}")
+            self.install_finished.emit(False, f"Error al ejecutar instalador:\n{str(ex)}")
 
 
 class DashEyesDashboard(QMainWindow):
@@ -98,6 +108,7 @@ class DashEyesDashboard(QMainWindow):
         self.dash_process = None
         self.install_worker = None
         self._init_window()
+        self._init_tray_icon()
         self._init_ui()
         self.run_diagnostics()
 
@@ -114,13 +125,31 @@ class DashEyesDashboard(QMainWindow):
             }
         """)
 
+    def _init_tray_icon(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.windowIcon())
+
+        tray_menu = QMenu()
+        show_action = tray_menu.addAction("Mostrar Dashboard")
+        show_action.triggered.connect(self.showNormal)
+        quit_action = tray_menu.addAction("Salir de DashEyes")
+        quit_action.triggered.connect(self._force_exit)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.showNormal()
+            self.activateWindow()
+
     def _init_ui(self):
         central_widget = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(28, 28, 28, 28)
         layout.setSpacing(16)
 
-        # Encabezado
         title = QLabel("DASHEYES")
         title.setStyleSheet("font-size: 26px; font-weight: 800; color: #38BDF8; letter-spacing: 2px;")
         subtitle = QLabel("Centro de Control y Diagnóstico de Entorno")
@@ -129,13 +158,11 @@ class DashEyesDashboard(QMainWindow):
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
-        # Separador
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("color: #334155;")
         layout.addWidget(sep)
 
-        # Checklist de Estado
         self.status_box = QVBoxLayout()
         self.status_box.setSpacing(10)
 
@@ -149,7 +176,6 @@ class DashEyesDashboard(QMainWindow):
 
         layout.addLayout(self.status_box)
 
-        # Barra de progreso
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setFixedHeight(4)
@@ -167,7 +193,6 @@ class DashEyesDashboard(QMainWindow):
 
         layout.addStretch()
 
-        # Botón de Reparación / Autoconfiguración
         self.repair_btn = QPushButton("Reparar / Instalar Dependencias")
         self.repair_btn.setFixedHeight(40)
         self.repair_btn.setStyleSheet("""
@@ -189,7 +214,6 @@ class DashEyesDashboard(QMainWindow):
         self.repair_btn.clicked.connect(self.on_repair_clicked)
         layout.addWidget(self.repair_btn)
 
-        # Botones Principales (Iniciar / Salir)
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(12)
 
@@ -269,7 +293,6 @@ class DashEyesDashboard(QMainWindow):
     def on_diagnostics_complete(self, res: dict):
         self.progress_bar.hide()
 
-        # 1. Verificación Estricta de Administrador
         if not res["is_admin"]:
             self.admin_badge[1].setText("DENEGADO (No es Admin)")
             self.admin_badge[1].setStyleSheet(
@@ -294,7 +317,6 @@ class DashEyesDashboard(QMainWindow):
 
         all_ok = True
 
-        # 2. Paquetes Python
         if res["packages_ok"]:
             self.packages_badge[1].setText("100% Instalado")
             self.packages_badge[1].setStyleSheet(
@@ -307,7 +329,6 @@ class DashEyesDashboard(QMainWindow):
             )
             all_ok = False
 
-        # 3. Driver OBS Virtual Camera
         if res["obs_driver_ok"]:
             self.obs_badge[1].setText("OK (DirectShow Activo)")
             self.obs_badge[1].setStyleSheet(
@@ -323,7 +344,6 @@ class DashEyesDashboard(QMainWindow):
         self.launch_btn.setEnabled(all_ok)
 
     def on_repair_clicked(self):
-        """Inicia la instalación asíncrona mediante QThread sin bloquear la interfaz."""
         req_file = os.path.join(os.path.dirname(__file__), "requirements.txt")
         self.progress_bar.show()
         self.repair_btn.setEnabled(False)
@@ -334,7 +354,6 @@ class DashEyesDashboard(QMainWindow):
         self.install_worker.start()
 
     def on_install_completed(self, success: bool, message: str):
-        """Callback invocado al concluir el hilo de instalación."""
         self.progress_bar.hide()
         self.repair_btn.setText("Reparar / Instalar Dependencias")
         self.repair_btn.setEnabled(True)
@@ -371,7 +390,32 @@ class DashEyesDashboard(QMainWindow):
             QMessageBox.critical(self, "Error al Iniciar", f"No se pudo iniciar main.py:\n{e}")
 
     def closeEvent(self, event):
+        if self.install_worker is not None and self.install_worker.isRunning():
+            self.install_worker.requestInterruption()
+            self.install_worker.wait(3000)
+
+        if self.dash_process is not None and self.dash_process.poll() is None:
+            self.hide()
+            self.tray_icon.showMessage(
+                "DashEyes en Ejecución",
+                "DashEyes sigue activo en segundo plano. Haz doble clic en este icono para reabrir.",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000
+            )
+            event.ignore()
+            return
+
         event.accept()
+
+    def _force_exit(self):
+        if self.dash_process is not None and self.dash_process.poll() is None:
+            self.dash_process.terminate()
+            try:
+                self.dash_process.wait(timeout=2.0)
+            except Exception:
+                pass
+        self.tray_icon.hide()
+        QApplication.quit()
 
 
 def main():

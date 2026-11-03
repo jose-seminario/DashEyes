@@ -1,6 +1,7 @@
 """
 teleprompter_ui.py - Módulo A: Teleprompter Invisible para Windows (PyQt6)
 Diseñado para operar como proceso independiente o autónomo dentro de DashEyes.
+Incluye re-aplicación reactiva de WDA_EXCLUDEFROMCAPTURE en moveEvent y screenChanged.
 """
 
 import sys
@@ -37,50 +38,43 @@ def set_window_capture_invisibility(hwnd: int) -> bool:
         result = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
         if not result:
             err = ctypes.get_last_error()
-            print(f"[Error Win32] No se pudo aplicar afinidad de ventana: Código {err}")
             return False
         return True
     except Exception as e:
-        print(f"[Excepción Win32] Fallo al invocar SetWindowDisplayAffinity: {e}")
         return False
 
 
 class InvisibleTeleprompter(QMainWindow):
     def __init__(self, ipc_queue=None):
         super().__init__()
-        self.ipc_queue = ipc_queue  # Canal de comunicación con el proceso de video
+        self.ipc_queue = ipc_queue
 
-        # Parámetros de desplazamiento
         self.is_paused = False
-        self.scroll_speed = 3  # Nivel de velocidad (1 a 10)
-        self.base_interval_ms = 40  # Intervalo base del timer
-        self._drag_pos = None  # Para permitir arrastre sin barra de título
+        self.scroll_speed = 3
+        self.base_interval_ms = 40
+        self._drag_pos = None
+        self._screen_listener_connected = False
 
         self._init_window_properties()
         self._init_ui_components()
         self._init_scroll_timer()
 
     def _init_window_properties(self):
-        """Configuración de flags de ventana para superposición y transparencia."""
         self.setWindowTitle("DashEyes - Invisible Teleprompter")
         self.resize(650, 320)
 
-        # Siempre al frente, sin bordes de ventana y modo herramienta (sin icono en Alt+Tab)
         self.setWindowFlags(
             Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.Tool
         )
-        # Permite canal alfa en el fondo
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
     def _init_ui_components(self):
-        """Construcción de la interfaz de texto y barra de estado."""
         root_layout = QVBoxLayout()
         root_layout.setContentsMargins(12, 12, 12, 12)
         root_layout.setSpacing(6)
 
-        # Barra superior con atajos y estado
         self.header_bar = QHBoxLayout()
         self.status_label = QLabel(f"Velocidad: {self.scroll_speed} | [Espacio] Pausa | [↑/↓] Vel | [Esc] Salir")
         self.status_label.setStyleSheet("""
@@ -95,7 +89,6 @@ class InvisibleTeleprompter(QMainWindow):
         self.header_bar.addWidget(self.status_label)
         root_layout.addLayout(self.header_bar)
 
-        # Área de lectura del guion
         self.text_editor = QTextEdit()
         self.text_editor.setReadOnly(True)
         self.text_editor.setStyleSheet("""
@@ -112,7 +105,6 @@ class InvisibleTeleprompter(QMainWindow):
             }
         """)
 
-        # Guion de prueba por defecto
         self.text_editor.setPlainText(
             "Bienvenido a DashEyes - Teleprompter Invisible.\n\n"
             "Este texto flota en tu pantalla para permitirte leer mientras mantienes "
@@ -135,31 +127,38 @@ class InvisibleTeleprompter(QMainWindow):
         self.setCentralWidget(container)
 
     def _init_scroll_timer(self):
-        """Inicializa el temporizador de auto-scroll."""
         self.scroll_timer = QTimer(self)
         self.scroll_timer.timeout.connect(self._scroll_tick)
         self._update_timer_speed()
         self.scroll_timer.start()
 
     def showEvent(self, event):
-        """Aplica la exclusión de captura en cuanto la ventana obtiene su HWND en Windows."""
         super().showEvent(event)
         hwnd = int(self.winId())
-        is_hidden = set_window_capture_invisibility(hwnd)
-        if is_hidden:
-            print(f"[OK] Ventana (HWND: {hwnd}) excluida de capturas de pantalla.")
-        else:
-            print(f"[Aviso] No se pudo asegurar la invisibilidad en el HWND: {hwnd}.")
+        set_window_capture_invisibility(hwnd)
+
+        # Enlazar evento screenChanged para reconfiguraciones de DWM/DPI
+        if not self._screen_listener_connected and self.windowHandle() is not None:
+            self.windowHandle().screenChanged.connect(self._on_screen_changed)
+            self._screen_listener_connected = True
+
+    def moveEvent(self, event):
+        """Re-aplica WDA_EXCLUDEFROMCAPTURE cada vez que la ventana cruza monitores."""
+        super().moveEvent(event)
+        hwnd = int(self.winId())
+        set_window_capture_invisibility(hwnd)
+
+    def _on_screen_changed(self, screen):
+        """Callback cuando Windows DWM transfiere la superficie a otro monitor."""
+        hwnd = int(self.winId())
+        set_window_capture_invisibility(hwnd)
 
     def _scroll_tick(self):
-        """Desplaza el scroll vertical en una unidad por tick."""
         if not self.is_paused:
             scrollbar = self.text_editor.verticalScrollBar()
             scrollbar.setValue(scrollbar.value() + 1)
 
     def _update_timer_speed(self):
-        """Calcula el intervalo del timer según la velocidad seleccionada (1 a 10)."""
-        # Mapeo: nivel 1 = 80ms, nivel 10 = 8ms
         interval = max(8, int(self.base_interval_ms - (self.scroll_speed - 3) * 6))
         self.scroll_timer.setInterval(interval)
         self._update_status_ui()
@@ -170,35 +169,24 @@ class InvisibleTeleprompter(QMainWindow):
             f"[{state_str}] | [Espacio] Alternar | [↑/↓] Vel | [Arrastrar para mover] | [Esc] Salir"
         )
 
-    # --------------------------------------------------------------------------
-    # CONTROLES DE TECLADO
-    # --------------------------------------------------------------------------
     def keyPressEvent(self, event: QKeyEvent):
         key = event.key()
-
         if key == Qt.Key.Key_Space:
             self.is_paused = not self.is_paused
             self._update_status_ui()
-
         elif key == Qt.Key.Key_Up:
             if self.scroll_speed < 10:
                 self.scroll_speed += 1
                 self._update_timer_speed()
-
         elif key == Qt.Key.Key_Down:
             if self.scroll_speed > 1:
                 self.scroll_speed -= 1
                 self._update_timer_speed()
-
         elif key == Qt.Key.Key_Escape:
             self.close()
-
         else:
             super().keyPressEvent(event)
 
-    # --------------------------------------------------------------------------
-    # SOPORTE DE ARRASTRE DE VENTANA SIN BORDES
-    # --------------------------------------------------------------------------
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -214,7 +202,6 @@ class InvisibleTeleprompter(QMainWindow):
 
 
 def run_teleprompter_process(ipc_queue=None):
-    """Punto de entrada exportable para ser ejecutado como proceso independiente."""
     app = QApplication(sys.argv)
     prompter = InvisibleTeleprompter(ipc_queue=ipc_queue)
     prompter.show()
