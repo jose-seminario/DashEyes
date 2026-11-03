@@ -1,7 +1,7 @@
 """
 dashboard.py - Centro de Control y Diagnóstico de DashEyes (V2.0)
-Punto de entrada visual para verificación de administrador, diagnóstico de hardware
-y dependencias, autoreparación e inicio orquestado de la aplicación.
+Punto de entrada visual para verificación estricta de administrador, diagnóstico de hardware
+y dependencias, autoreparación asíncrona (sin UI freeze) e inicio orquestado.
 """
 
 import sys
@@ -11,7 +11,6 @@ import subprocess
 import webbrowser
 import importlib
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -58,7 +57,6 @@ class DiagnosticWorker(QThread):
         # 3. Verificación del Driver OBS Virtual Camera (DirectShow)
         try:
             import pyvirtualcam
-            # Intentar instanciar la cámara virtual brevemente para comprobar registro del driver
             with pyvirtualcam.Camera(width=640, height=480, fps=30) as cam:
                 results["obs_driver_ok"] = True
                 results["obs_details"] = f"Driver Detectado ({cam.device})"
@@ -69,10 +67,36 @@ class DiagnosticWorker(QThread):
         self.diagnostics_complete.emit(results)
 
 
+class InstallWorker(QThread):
+    """Ejecuta la instalación de pip en segundo plano con notificación por señales."""
+    install_finished = pyqtSignal(bool, str)
+
+    def __init__(self, requirements_path: str):
+        super().__init__()
+        self.requirements_path = requirements_path
+
+    def run(self):
+        try:
+            cmd = [sys.executable, "-m", "pip", "install", "-r", self.requirements_path]
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            self.install_finished.emit(True, "Dependencias instaladas correctamente.")
+        except subprocess.CalledProcessError as e:
+            err_msg = e.stderr if e.stderr else e.stdout
+            self.install_finished.emit(False, f"Fallo en pip install:\n{err_msg}")
+        except Exception as ex:
+            self.install_finished.emit(False, f"Excepción al ejecutar el instalador:\n{str(ex)}")
+
+
 class DashEyesDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
         self.dash_process = None
+        self.install_worker = None
         self._init_window()
         self._init_ui()
         self.run_diagnostics()
@@ -80,7 +104,6 @@ class DashEyesDashboard(QMainWindow):
     def _init_window(self):
         self.setWindowTitle("DashEyes - Centro de Control V2.0")
         self.setFixedSize(540, 520)
-        # Paleta oscura moderna
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #0F172A;
@@ -126,7 +149,7 @@ class DashEyesDashboard(QMainWindow):
 
         layout.addLayout(self.status_box)
 
-        # Barra de progreso para tareas
+        # Barra de progreso
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setFixedHeight(4)
@@ -238,7 +261,6 @@ class DashEyesDashboard(QMainWindow):
         return (row, status_badge)
 
     def run_diagnostics(self):
-        """Ejecuta los diagnósticos sin bloquear la interfaz."""
         self.progress_bar.show()
         self.worker = DiagnosticWorker()
         self.worker.diagnostics_complete.connect(self.on_diagnostics_complete)
@@ -246,54 +268,82 @@ class DashEyesDashboard(QMainWindow):
 
     def on_diagnostics_complete(self, res: dict):
         self.progress_bar.hide()
+
+        # 1. Verificación Estricta de Administrador
+        if not res["is_admin"]:
+            self.admin_badge[1].setText("DENEGADO (No es Admin)")
+            self.admin_badge[1].setStyleSheet(
+                "color: #EF4444; background-color: rgba(239, 68, 68, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+            )
+            self.launch_btn.setEnabled(False)
+            self.repair_btn.setEnabled(False)
+
+            QMessageBox.critical(
+                self,
+                "Acceso Denegado - Requiere Administrador",
+                "DashEyes requiere privilegios de Administrador para gestionar drivers DirectShow de video y dependencias del sistema.\n\n"
+                "Por favor, cierra el programa, haz clic derecho sobre la terminal o acceso directo y selecciona 'Ejecutar como administrador'."
+            )
+            self.close()
+            return
+
+        self.admin_badge[1].setText("OK (Administrador)")
+        self.admin_badge[1].setStyleSheet(
+            "color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+        )
+
         all_ok = True
 
-        # 1. Admin Status
-        if res["is_admin"]:
-            self.admin_badge[1].setText("OK (Administrador)")
-            self.admin_badge[1].setStyleSheet("color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;")
-        else:
-            self.admin_badge[1].setText("ADVERTENCIA (Usuario Estándar)")
-            self.admin_badge[1].setStyleSheet("color: #F59E0B; background-color: rgba(245, 158, 11, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;")
-            # No bloqueante absoluto, pero avisa
-
-        # 2. Packages Status
+        # 2. Paquetes Python
         if res["packages_ok"]:
             self.packages_badge[1].setText("100% Instalado")
-            self.packages_badge[1].setStyleSheet("color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;")
+            self.packages_badge[1].setStyleSheet(
+                "color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+            )
         else:
             self.packages_badge[1].setText("Faltan Paquetes")
-            self.packages_badge[1].setStyleSheet("color: #EF4444; background-color: rgba(239, 68, 68, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;")
+            self.packages_badge[1].setStyleSheet(
+                "color: #EF4444; background-color: rgba(239, 68, 68, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+            )
             all_ok = False
 
-        # 3. OBS Driver Status
+        # 3. Driver OBS Virtual Camera
         if res["obs_driver_ok"]:
             self.obs_badge[1].setText("OK (DirectShow Activo)")
-            self.obs_badge[1].setStyleSheet("color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;")
+            self.obs_badge[1].setStyleSheet(
+                "color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+            )
         else:
             self.obs_badge[1].setText("No Detectado")
-            self.obs_badge[1].setStyleSheet("color: #EF4444; background-color: rgba(239, 68, 68, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;")
+            self.obs_badge[1].setStyleSheet(
+                "color: #EF4444; background-color: rgba(239, 68, 68, 0.15); padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+            )
             all_ok = False
 
-        # Habilitación del botón de inicio si todo está en verde
         self.launch_btn.setEnabled(all_ok)
 
     def on_repair_clicked(self):
-        """Intenta instalar requirements.txt y ofrece descargar OBS Studio."""
+        """Inicia la instalación asíncrona mediante QThread sin bloquear la interfaz."""
         req_file = os.path.join(os.path.dirname(__file__), "requirements.txt")
         self.progress_bar.show()
         self.repair_btn.setEnabled(False)
-        self.repair_btn.setText("Instalando paquetes...")
+        self.repair_btn.setText("Instalando paquetes en segundo plano...")
 
-        QApplication.processEvents()
+        self.install_worker = InstallWorker(req_file)
+        self.install_worker.install_finished.connect(self.on_install_completed)
+        self.install_worker.start()
 
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "-r", req_file], check=True)
-            QMessageBox.information(self, "Instalación Completada", "Las dependencias de Python se han instalado correctamente.")
-        except Exception as e:
-            QMessageBox.warning(self, "Aviso de Instalación", f"Error al ejecutar pip: {e}")
+    def on_install_completed(self, success: bool, message: str):
+        """Callback invocado al concluir el hilo de instalación."""
+        self.progress_bar.hide()
+        self.repair_btn.setText("Reparar / Instalar Dependencias")
+        self.repair_btn.setEnabled(True)
 
-        # Preguntar si desea descargar OBS Studio para el driver virtual
+        if success:
+            QMessageBox.information(self, "Instalación Completada", message)
+        else:
+            QMessageBox.warning(self, "Aviso de Instalación", message)
+
         reply = QMessageBox.question(
             self,
             "Driver de Cámara Virtual",
@@ -303,12 +353,9 @@ class DashEyesDashboard(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             webbrowser.open("https://obsproject.com/download")
 
-        self.repair_btn.setText("Reparar / Instalar Dependencias")
-        self.repair_btn.setEnabled(True)
         self.run_diagnostics()
 
     def on_launch_clicked(self):
-        """Inicia DashEyes ejecutando main.py en un subproceso independiente."""
         main_py = os.path.join(os.path.dirname(__file__), "main.py")
         try:
             self.dash_process = subprocess.Popen([sys.executable, main_py])
@@ -324,7 +371,6 @@ class DashEyesDashboard(QMainWindow):
             QMessageBox.critical(self, "Error al Iniciar", f"No se pudo iniciar main.py:\n{e}")
 
     def closeEvent(self, event):
-        # Si el usuario cierra el dashboard, se asegura que los workers se detengan limpiamente
         event.accept()
 
 
