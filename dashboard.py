@@ -1,13 +1,12 @@
 """
-dashboard.py - Centro de Control y Diagnóstico de DashEyes (V2.0 Final)
-freeze_support() en primera línea, selector de guión (.txt/.md),
-QSystemTrayIcon, y lanzamiento asíncrono con paso de parámetros.
+dashboard.py - Centro de Control y Diagnóstico de DashEyes (V2.0 Dual Mode)
+Arquitectura de arranque dual: Modo Teleprompter (sin admin/sin OBS) y Modo Eye Contact (Beta).
+Incluye UAC bajo demanda (ShellExecuteW 'runas') y QSystemTrayIcon.
 """
 
 import sys
 import multiprocessing as mp
 
-# CRÍTICO: freeze_support() en primera línea para empaquetado PyInstaller en Windows
 if __name__ == "__main__":
     mp.freeze_support()
 
@@ -17,6 +16,7 @@ import subprocess
 import webbrowser
 import importlib
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -122,15 +122,10 @@ class DashEyesDashboard(QMainWindow):
 
     def _init_window(self):
         self.setWindowTitle("DashEyes - Centro de Control V2.0")
-        self.setFixedSize(560, 580)
+        self.setFixedSize(580, 620)
         self.setStyleSheet("""
-            QMainWindow {
-                background-color: #0F172A;
-            }
-            QWidget {
-                color: #E2E8F0;
-                font-family: 'Segoe UI', Arial, sans-serif;
-            }
+            QMainWindow { background-color: #0F172A; }
+            QWidget { color: #E2E8F0; font-family: 'Segoe UI', Arial, sans-serif; }
         """)
 
     def _init_tray_icon(self):
@@ -155,12 +150,12 @@ class DashEyesDashboard(QMainWindow):
     def _init_ui(self):
         central_widget = QWidget()
         layout = QVBoxLayout()
-        layout.setContentsMargins(28, 24, 28, 24)
-        layout.setSpacing(14)
+        layout.setContentsMargins(28, 22, 28, 22)
+        layout.setSpacing(12)
 
         title = QLabel("DASHEYES")
         title.setStyleSheet("font-size: 26px; font-weight: 800; color: #38BDF8; letter-spacing: 2px;")
-        subtitle = QLabel("Centro de Control y Diagnóstico de Entorno V2.0")
+        subtitle = QLabel("Centro de Control y Selección de Modo V2.0")
         subtitle.setStyleSheet("font-size: 13px; color: #94A3B8;")
 
         layout.addWidget(title)
@@ -171,12 +166,12 @@ class DashEyesDashboard(QMainWindow):
         sep.setStyleSheet("color: #334155;")
         layout.addWidget(sep)
 
-        # Checklist de Diagnóstico
+        # Panel de Diagnóstico
         self.status_box = QVBoxLayout()
-        self.status_box.setSpacing(8)
+        self.status_box.setSpacing(6)
 
-        self.admin_badge = self._create_checklist_item("Privilegios de Administrador", "Verificando...")
-        self.packages_badge = self._create_checklist_item("Paquetes de Python (Requisitos)", "Verificando...")
+        self.admin_badge = self._create_checklist_item("Nivel de Permisos", "Verificando...")
+        self.packages_badge = self._create_checklist_item("Paquetes de Python", "Verificando...")
         self.obs_badge = self._create_checklist_item("Driver OBS Virtual Camera", "Verificando...")
 
         self.status_box.addLayout(self.admin_badge[0])
@@ -235,9 +230,9 @@ class DashEyesDashboard(QMainWindow):
 
         layout.addStretch()
 
-        # Botón de Reparación
-        self.repair_btn = QPushButton("Reparar / Instalar Dependencias")
-        self.repair_btn.setFixedHeight(38)
+        # Botón de Reparación con UAC Bajo Demanda
+        self.repair_btn = QPushButton("Configurar / Reparar Entorno (UAC)")
+        self.repair_btn.setFixedHeight(36)
         self.repair_btn.setStyleSheet("""
             QPushButton {
                 background-color: #334155;
@@ -245,6 +240,7 @@ class DashEyesDashboard(QMainWindow):
                 font-weight: 600;
                 border-radius: 6px;
                 border: 1px solid #475569;
+                font-size: 12px;
             }
             QPushButton:hover { background-color: #475569; }
             QPushButton:disabled { color: #64748B; background-color: #1E293B; }
@@ -252,18 +248,33 @@ class DashEyesDashboard(QMainWindow):
         self.repair_btn.clicked.connect(self.on_repair_clicked)
         layout.addWidget(self.repair_btn)
 
-        # Botones Principales (Iniciar / Salir)
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(12)
+        # BOTONES DUALES DE LANZAMIENTO
+        # Modo 1: Teleprompter (Estable / Sin Admin / Sin OBS)
+        self.launch_teleprompter_btn = QPushButton("Iniciar Modo Teleprompter (Sin Admin / Rápido)")
+        self.launch_teleprompter_btn.setFixedHeight(44)
+        self.launch_teleprompter_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #059669;
+                color: #FFFFFF;
+                font-size: 14px;
+                font-weight: 700;
+                border-radius: 6px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #047857; }
+        """)
+        self.launch_teleprompter_btn.clicked.connect(self.on_launch_teleprompter_clicked)
+        layout.addWidget(self.launch_teleprompter_btn)
 
-        self.launch_btn = QPushButton("Iniciar DashEyes")
-        self.launch_btn.setFixedHeight(46)
-        self.launch_btn.setEnabled(False)
-        self.launch_btn.setStyleSheet("""
+        # Modo 2: Eye Contact (Completo / Beta)
+        self.launch_eye_contact_btn = QPushButton("Iniciar Modo Eye Contact (Beta / Requiere OBS)")
+        self.launch_eye_contact_btn.setFixedHeight(44)
+        self.launch_eye_contact_btn.setEnabled(False)
+        self.launch_eye_contact_btn.setStyleSheet("""
             QPushButton {
                 background-color: #0284C7;
                 color: #FFFFFF;
-                font-size: 15px;
+                font-size: 14px;
                 font-weight: 700;
                 border-radius: 6px;
                 border: none;
@@ -271,15 +282,17 @@ class DashEyesDashboard(QMainWindow):
             QPushButton:hover { background-color: #0369A1; }
             QPushButton:disabled { background-color: #1E293B; color: #64748B; }
         """)
-        self.launch_btn.clicked.connect(self.on_launch_clicked)
+        self.launch_eye_contact_btn.clicked.connect(self.on_launch_eye_contact_clicked)
+        layout.addWidget(self.launch_eye_contact_btn)
 
+        # Botón Salir
         self.exit_btn = QPushButton("Salir")
-        self.exit_btn.setFixedHeight(46)
+        self.exit_btn.setFixedHeight(36)
         self.exit_btn.setStyleSheet("""
             QPushButton {
                 background-color: transparent;
                 color: #94A3B8;
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: 600;
                 border-radius: 6px;
                 border: 1px solid #334155;
@@ -287,10 +300,7 @@ class DashEyesDashboard(QMainWindow):
             QPushButton:hover { background-color: #1E293B; color: #F8FAFC; }
         """)
         self.exit_btn.clicked.connect(self.close)
-
-        btn_layout.addWidget(self.exit_btn, 1)
-        btn_layout.addWidget(self.launch_btn, 2)
-        layout.addLayout(btn_layout)
+        layout.addWidget(self.exit_btn)
 
         central_widget.setLayout(layout)
         self.setCentralWidget(central_widget)
@@ -342,32 +352,22 @@ class DashEyesDashboard(QMainWindow):
         self.worker.start()
 
     def on_diagnostics_complete(self, res: dict):
+        """Diagnóstico no bloqueante: la app abre sin importar si es admin o si falta OBS."""
         self.progress_bar.hide()
 
-        if not res["is_admin"]:
-            self.admin_badge[1].setText("DENEGADO (No es Admin)")
+        # 1. Nivel de Administrador (Informativo, NUNCA bloquea el teleprompter)
+        if res["is_admin"]:
+            self.admin_badge[1].setText("Administrador (Acceso Total)")
             self.admin_badge[1].setStyleSheet(
-                "color: #EF4444; background-color: rgba(239, 68, 68, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
+                "color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
             )
-            self.launch_btn.setEnabled(False)
-            self.repair_btn.setEnabled(False)
-
-            QMessageBox.critical(
-                self,
-                "Acceso Denegado - Requiere Administrador",
-                "DashEyes requiere privilegios de Administrador para gestionar drivers DirectShow de video y dependencias del sistema.\n\n"
-                "Por favor, cierra el programa, haz clic derecho sobre la terminal o acceso directo y selecciona 'Ejecutar como administrador'."
+        else:
+            self.admin_badge[1].setText("Usuario Estándar (Modo Teleprompter Disponible)")
+            self.admin_badge[1].setStyleSheet(
+                "color: #38BDF8; background-color: rgba(56, 189, 248, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
             )
-            self.close()
-            return
 
-        self.admin_badge[1].setText("OK (Administrador)")
-        self.admin_badge[1].setStyleSheet(
-            "color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
-        )
-
-        all_ok = True
-
+        # 2. Paquetes Python
         if res["packages_ok"]:
             self.packages_badge[1].setText("100% Instalado")
             self.packages_badge[1].setStyleSheet(
@@ -378,27 +378,49 @@ class DashEyesDashboard(QMainWindow):
             self.packages_badge[1].setStyleSheet(
                 "color: #EF4444; background-color: rgba(239, 68, 68, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
             )
-            all_ok = False
 
+        # 3. Driver OBS Virtual Camera
         if res["obs_driver_ok"]:
             self.obs_badge[1].setText("OK (DirectShow Activo)")
             self.obs_badge[1].setStyleSheet(
                 "color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
             )
+            # Solo se habilita el modo Eye Contact si el driver está presente
+            self.launch_eye_contact_btn.setEnabled(res["packages_ok"])
         else:
-            self.obs_badge[1].setText("No Detectado")
+            self.obs_badge[1].setText("No Detectado (Eye Contact Inactivo)")
             self.obs_badge[1].setStyleSheet(
-                "color: #EF4444; background-color: rgba(239, 68, 68, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
+                "color: #F59E0B; background-color: rgba(245, 158, 11, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
             )
-            all_ok = False
+            self.launch_eye_contact_btn.setEnabled(False)
 
-        self.launch_btn.setEnabled(all_ok)
+        # El modo Teleprompter SIEMPRE está habilitado
+        self.launch_teleprompter_btn.setEnabled(True)
 
     def on_repair_clicked(self):
+        """Elevación de UAC bajo demanda usando ShellExecuteW 'runas' solo si no es admin."""
+        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
         req_file = os.path.join(os.path.dirname(__file__), "requirements.txt")
+
+        if not is_admin:
+            # Solicitar elevación UAC en Windows
+            script_path = os.path.abspath(__file__)
+            params = f'"{script_path}" --elevated-repair'
+            ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+            if ret > 32:
+                QMessageBox.information(
+                    self,
+                    "Elevación Solicitada",
+                    "Se ha solicitado elevación de Administrador para instalar dependencias.\n"
+                    "Al finalizar la ventana de instalación, pulsa Aceptar para refrescar el estado."
+                )
+            self.run_diagnostics()
+            return
+
+        # Si ya es admin, ejecutar hilo de instalación estándar
         self.progress_bar.show()
         self.repair_btn.setEnabled(False)
-        self.repair_btn.setText("Instalando paquetes en segundo plano...")
+        self.repair_btn.setText("Instalando paquetes...")
 
         self.install_worker = InstallWorker(req_file)
         self.install_worker.install_finished.connect(self.on_install_completed)
@@ -406,7 +428,7 @@ class DashEyesDashboard(QMainWindow):
 
     def on_install_completed(self, success: bool, message: str):
         self.progress_bar.hide()
-        self.repair_btn.setText("Reparar / Instalar Dependencias")
+        self.repair_btn.setText("Configurar / Reparar Entorno (UAC)")
         self.repair_btn.setEnabled(True)
 
         if success:
@@ -425,27 +447,42 @@ class DashEyesDashboard(QMainWindow):
 
         self.run_diagnostics()
 
-    def on_launch_clicked(self):
+    def on_launch_teleprompter_clicked(self):
+        """Lanza exclusivamente el Modo Teleprompter (Liviano / Sin OBS / Sin Admin)."""
         main_py = os.path.join(os.path.dirname(__file__), "main.py")
-        cmd = [sys.executable, main_py]
+        cmd = [sys.executable, main_py, "--mode", "teleprompter"]
         if self.selected_script_path:
             cmd.extend(["--script", self.selected_script_path])
 
         try:
             self.dash_process = subprocess.Popen(cmd)
-            self.launch_btn.setEnabled(False)
-            self.launch_btn.setText("DashEyes en Ejecución")
-            self.launch_btn.setStyleSheet("background-color: #10B981; color: white; font-weight: bold;")
             QMessageBox.information(
                 self,
-                "DashEyes Iniciado",
-                "DashEyes se ha lanzado con éxito.\n"
-                "• Atajos Globales Activos: [F8] Pausa, [F9/F10] Velocidad, [F2] HUD.\n"
-                "• El teleprompter flotará en pantalla y la cámara virtual está activa.\n\n"
-                "Puedes cerrar este Dashboard sin interrumpir la llamada."
+                "Modo Teleprompter Activo",
+                "Teleprompter invisible iniciado con éxito (Modo Liviano).\n"
+                "• Atajos: [F8] Pausa, [F9/F10] Velocidad, [F2] HUD.\n"
+                "• No consume cámara ni requiere permisos de administrador."
             )
         except Exception as e:
-            QMessageBox.critical(self, "Error al Iniciar", f"No se pudo iniciar main.py:\n{e}")
+            QMessageBox.critical(self, "Error al Iniciar", f"No se pudo iniciar el teleprompter:\n{e}")
+
+    def on_launch_eye_contact_clicked(self):
+        """Lanza el Modo Eye Contact Completo (Teleprompter + Visión Artificial + Cámara Virtual)."""
+        main_py = os.path.join(os.path.dirname(__file__), "main.py")
+        cmd = [sys.executable, main_py, "--mode", "eye_contact"]
+        if self.selected_script_path:
+            cmd.extend(["--script", self.selected_script_path])
+
+        try:
+            self.dash_process = subprocess.Popen(cmd)
+            QMessageBox.information(
+                self,
+                "Modo Eye Contact Activo",
+                "DashEyes lanzado con Corrección de Mirada y Cámara Virtual.\n"
+                "• Selecciona 'OBS Virtual Camera' en tu app de videollamada."
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error al Iniciar", f"No se pudo iniciar el modo Eye Contact:\n{e}")
 
     def closeEvent(self, event):
         if self.install_worker is not None and self.install_worker.isRunning():
@@ -477,6 +514,12 @@ class DashEyesDashboard(QMainWindow):
 
 
 def main():
+    # Soporte para elevación por línea de comandos
+    if len(sys.argv) > 1 and sys.argv[1] == "--elevated-repair":
+        req_file = os.path.join(os.path.dirname(__file__), "requirements.txt")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-r", req_file])
+        sys.exit(0)
+
     app = QApplication(sys.argv)
     window = DashEyesDashboard()
     window.show()

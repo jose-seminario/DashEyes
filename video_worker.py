@@ -305,7 +305,18 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
     frame_counter = 0
 
     try:
-        with pyvirtualcam.Camera(width=width, height=height, fps=fps, fmt=pyvirtualcam.PixelFormat.BGR) as vcam:
+        try:
+            vcam_ctx = pyvirtualcam.Camera(width=width, height=height, fps=fps, fmt=pyvirtualcam.PixelFormat.BGR)
+        except Exception as vcam_err:
+            print(f"[VIDEO WORKER AVISO] OBS Virtual Camera no disponible: {vcam_err}", file=sys.stderr)
+            if ack_pipe is not None:
+                try:
+                    ack_pipe.send({"cmd": "ERROR", "reason": "OBS_NOT_FOUND"})
+                except Exception:
+                    pass
+            return
+
+        with vcam_ctx as vcam:
             vcam_instance = vcam
 
             while not stop_event.is_set():

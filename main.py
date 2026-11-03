@@ -1,6 +1,7 @@
 """
-main.py - Orquestador Multiprocesos de DashEyes (V2.0 Final)
-freeze_support() en primera línea, Pipes unidireccionales y soporte para --script.
+main.py - Orquestador Multiprocesos de DashEyes (V2.0 Dual Mode)
+freeze_support() en primera línea, arranque condicional por --mode (teleprompter/eye_contact),
+pipes unidireccionales y soporte para --script.
 """
 
 import sys
@@ -19,6 +20,12 @@ from video_worker import run_video_worker
 def parse_arguments():
     parser = argparse.ArgumentParser(description="DashEyes Orchestrator")
     parser.add_argument("--script", default=None, help="Ruta hacia el archivo de guión (.txt o .md)")
+    parser.add_argument(
+        "--mode",
+        default="teleprompter",
+        choices=["teleprompter", "eye_contact"],
+        help="Modo de ejecución: teleprompter (liviano/sin admin) o eye_contact (cámara virtual)"
+    )
     args, _ = parser.parse_known_args()
     return args
 
@@ -29,8 +36,36 @@ def main():
 
     print("=" * 68)
     print("      DASHEYES V2.0 - TELEPROMPTER INVISIBLE & MOTOR BLINDADO       ")
+    print(f"      MODO SELECCIONADO: {args.mode.upper()}")
     print("=" * 68)
 
+    # 1. MODO TELEPROMPTER (Liviano, sin cámara, sin OBS, sin admin)
+    if args.mode == "teleprompter":
+        teleprompter_process = mp.Process(
+            target=run_teleprompter_process,
+            args=(None, args.script),
+            name="DashEyes-Teleprompter"
+        )
+        print(f"[ORQUESTADOR] Iniciando Modo Teleprompter (Guión: {args.script or 'Por defecto'})...")
+        teleprompter_process.start()
+
+        print("\n[ESTADO: ACTIVO] Atajos Globales F8 (Pausa), F9/F10 (Velocidad), F2 (HUD).")
+
+        try:
+            while teleprompter_process.is_alive():
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            print("\n[ORQUESTADOR] Interrupción por teclado.")
+        finally:
+            if teleprompter_process.is_alive():
+                teleprompter_process.join(timeout=1.0)
+                if teleprompter_process.is_alive():
+                    teleprompter_process.terminate()
+                    teleprompter_process.join(timeout=0.5)
+            print("[ORQUESTADOR] Teleprompter cerrado correctamente.")
+        return
+
+    # 2. MODO EYE CONTACT (Completo con video y cámara virtual)
     cmd_pipe_parent, cmd_pipe_child = mp.Pipe(duplex=False)
     ack_pipe_child, ack_pipe_parent = mp.Pipe(duplex=False)
 
