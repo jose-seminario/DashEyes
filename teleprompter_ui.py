@@ -8,6 +8,7 @@ import sys
 import os
 import ctypes
 from ctypes import wintypes
+import config_manager
 from PyQt6.QtCore import Qt, QTimer, QPoint
 from PyQt6.QtGui import QKeyEvent, QMouseEvent, QDropEvent, QDragEnterEvent, QFont
 from PyQt6.QtWidgets import (
@@ -51,6 +52,12 @@ class InvisibleTeleprompter(QMainWindow):
         super().__init__()
         self.script_path = script_path
         self.ipc_pipe = ipc_pipe
+
+        self.config = config_manager.load_config()
+        self.enable_level1 = self.config.get("enable_level1_controls", True)
+        self.is_eye_contact_active = bool(self.ipc_pipe is not None)
+        self.eye_contact_intensity = self.config.get("eye_contact", {}).get("intensity", 50)
+        self.eye_contact_enabled = self.config.get("eye_contact", {}).get("enabled", True)
 
         self.is_paused = False
         self.scroll_speed = 3
@@ -176,8 +183,33 @@ class InvisibleTeleprompter(QMainWindow):
         self.speed_slider.valueChanged.connect(self._on_speed_slider_changed)
         hud_layout.addWidget(self.speed_slider)
 
+        # Controles Eye Contact en HUD (Nivel 1: solo si enable_level1 y si corre con tubería de video)
+        if self.enable_level1 and self.is_eye_contact_active:
+            sep = QFrame()
+            sep.setFrameShape(QFrame.Shape.VLine)
+            sep.setStyleSheet("color: #475569;")
+            hud_layout.addWidget(sep)
+
+            hud_layout.addWidget(QLabel("Mirada:"))
+            self.eye_slider = QSlider(Qt.Orientation.Horizontal)
+            self.eye_slider.setRange(0, 100)
+            self.eye_slider.setValue(self.eye_contact_intensity)
+            self.eye_slider.valueChanged.connect(self._on_eye_intensity_changed)
+            hud_layout.addWidget(self.eye_slider)
+
+            self.eye_toggle_btn = QPushButton()
+            self.eye_toggle_btn.setFixedSize(54, 20)
+            self._update_eye_toggle_style()
+            self.eye_toggle_btn.clicked.connect(self._on_eye_toggle_clicked)
+            hud_layout.addWidget(self.eye_toggle_btn)
+
         self.hud_frame.hide()  # Inicia plegado
         root_layout.addWidget(self.hud_frame)
+
+        # Preparación arquitectónica Nivel 2: contenedor de previsualización en vivo (colapsado)
+        self.preview_container = QWidget()
+        self.preview_container.setVisible(False)
+        root_layout.addWidget(self.preview_container)
 
         container = QWidget()
         container.setLayout(root_layout)
@@ -235,6 +267,74 @@ class InvisibleTeleprompter(QMainWindow):
     def _on_speed_slider_changed(self, val):
         self.scroll_speed = val
         self._update_timer_speed()
+
+    def _update_eye_toggle_style(self):
+        if not hasattr(self, "eye_toggle_btn"):
+            return
+        if self.eye_contact_enabled:
+            self.eye_toggle_btn.setText("👁 ON")
+            self.eye_toggle_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #059669;
+                    color: #FFFFFF;
+                    font-size: 10px;
+                    font-weight: 700;
+                    border-radius: 3px;
+                    border: none;
+                }
+                QPushButton:hover { background-color: #047857; }
+            """)
+        else:
+            self.eye_toggle_btn.setText("👁 OFF")
+            self.eye_toggle_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #475569;
+                    color: #94A3B8;
+                    font-size: 10px;
+                    font-weight: 700;
+                    border-radius: 3px;
+                    border: none;
+                }
+                QPushButton:hover { background-color: #64748B; }
+            """)
+
+    def _on_eye_intensity_changed(self, val):
+        self.eye_contact_intensity = val
+        if self.ipc_pipe is not None:
+            try:
+                self.ipc_pipe.send({
+                    "cmd": "SET_INTENSITY",
+                    "intensity": val,
+                    "enabled": self.eye_contact_enabled
+                })
+            except Exception:
+                pass
+        config_manager.update_eye_contact_config(intensity=val)
+
+    def _on_eye_toggle_clicked(self):
+        self.eye_contact_enabled = not self.eye_contact_enabled
+        self._update_eye_toggle_style()
+        if self.ipc_pipe is not None:
+            try:
+                self.ipc_pipe.send({
+                    "cmd": "TOGGLE_CORRECTION",
+                    "enabled": self.eye_contact_enabled
+                })
+            except Exception:
+                pass
+        config_manager.update_eye_contact_config(enabled=self.eye_contact_enabled)
+
+    def closeEvent(self, event):
+        if self.ipc_pipe is not None:
+            try:
+                self.ipc_pipe.send({"cmd": "STOP"})
+            except Exception:
+                pass
+            try:
+                self.ipc_pipe.close()
+            except Exception:
+                pass
+        event.accept()
 
     def _init_scroll_timer(self):
         self.scroll_timer = QTimer(self)
