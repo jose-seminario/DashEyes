@@ -1,7 +1,7 @@
 """
-main.py - Orquestador Multiprocesos de DashEyes (V2.0 Dual Mode)
+main.py - Orquestador Multiprocesos de DashEyes (V2.0 Dual Mode / Nivel 1)
 freeze_support() en primera línea, arranque condicional por --mode (teleprompter/eye_contact),
-pipes unidireccionales y soporte para --script.
+conexión directa de tuberías UI -> Video y cierre explícito en finally.
 """
 
 import sys
@@ -13,6 +13,7 @@ if __name__ == "__main__":
 
 import time
 import argparse
+import config_manager
 from teleprompter_ui import run_teleprompter_process
 from video_worker import run_video_worker
 
@@ -26,6 +27,8 @@ def parse_arguments():
         choices=["teleprompter", "eye_contact"],
         help="Modo de ejecución: teleprompter (liviano/sin admin) o eye_contact (cámara virtual)"
     )
+    parser.add_argument("--intensity", type=int, default=None, help="Intensidad de corrección de mirada (0-100)")
+    parser.add_argument("--eye-contact-enabled", type=int, default=None, help="Estado inicial de activación (1 o 0)")
     args, _ = parser.parse_known_args()
     return args
 
@@ -33,6 +36,11 @@ def parse_arguments():
 def main():
     mp.freeze_support()
     args = parse_arguments()
+
+    # Si se pasan parámetros de calibración desde el Dashboard, sincronizar en config_manager
+    if args.intensity is not None or args.eye_contact_enabled is not None:
+        enabled_bool = bool(args.eye_contact_enabled) if args.eye_contact_enabled is not None else None
+        config_manager.update_eye_contact_config(intensity=args.intensity, enabled=enabled_bool)
 
     print("=" * 68)
     print("      DASHEYES V2.0 - TELEPROMPTER INVISIBLE & MOTOR BLINDADO       ")
@@ -66,6 +74,7 @@ def main():
         return
 
     # 2. MODO EYE CONTACT (Completo con video y cámara virtual)
+    # Tuberías directas: cmd_pipe_parent se entrega a teleprompter_process para control en vivo
     cmd_pipe_parent, cmd_pipe_child = mp.Pipe(duplex=False)
     ack_pipe_child, ack_pipe_parent = mp.Pipe(duplex=False)
 
@@ -77,7 +86,7 @@ def main():
 
     teleprompter_process = mp.Process(
         target=run_teleprompter_process,
-        args=(None, args.script),
+        args=(cmd_pipe_parent, args.script),
         name="DashEyes-Teleprompter"
     )
 
@@ -110,8 +119,14 @@ def main():
     finally:
         print("\n[ORQUESTADOR] Ejecutando Handshake de parada...")
 
+        # Implementación Opción (b): Enviar STOP de respaldo y cerrar explícitamente el descriptor
         try:
             cmd_pipe_parent.send({"cmd": "STOP"})
+        except Exception:
+            pass
+
+        try:
+            cmd_pipe_parent.close()
         except Exception:
             pass
 
@@ -147,7 +162,6 @@ def main():
                 teleprompter_process.join(timeout=0.5)
 
         try:
-            cmd_pipe_parent.close()
             ack_pipe_parent.close()
         except Exception:
             pass
