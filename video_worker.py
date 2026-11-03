@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import pyvirtualcam
+import config_manager
 
 LEFT_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 RIGHT_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
@@ -299,7 +300,19 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
         min_tracking_confidence=0.5
     )
 
-    engine = EyeContactEngine(vertical_shift_px=5, horizontal_inward_px=1)
+    # Carga de configuración y respeto del Feature Flag de Nivel 1
+    config = config_manager.load_config()
+    enable_level1 = config.get("enable_level1_controls", True)
+
+    if enable_level1:
+        initial_intensity = config.get("eye_contact", {}).get("intensity", 50)
+        initial_enabled = config.get("eye_contact", {}).get("enabled", True)
+        v_shift, h_shift = config_manager.calculate_shifts(initial_intensity)
+        engine = EyeContactEngine(vertical_shift_px=v_shift, horizontal_inward_px=h_shift)
+        engine.correction_enabled = initial_enabled
+    else:
+        engine = EyeContactEngine(vertical_shift_px=5, horizontal_inward_px=1)
+
     last_processed_frame_id = -1
     vcam_instance = None
     frame_counter = 0
@@ -333,6 +346,14 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
                                     engine.correction_enabled = msg.get("enabled", True)
                                 elif cmd == "SET_SHIFT":
                                     engine.vertical_shift_px = msg.get("shift_px", 5)
+                                elif cmd == "SET_INTENSITY":
+                                    if enable_level1:
+                                        intensity_val = msg.get("intensity", 50)
+                                        v_val, h_val = config_manager.calculate_shifts(intensity_val)
+                                        engine.vertical_shift_px = v_val
+                                        engine.horizontal_inward_px = h_val
+                                        if "enabled" in msg:
+                                            engine.correction_enabled = bool(msg.get("enabled", True))
                     except Exception:
                         pass
 
