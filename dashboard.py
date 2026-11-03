@@ -1,7 +1,7 @@
 """
-dashboard.py - Centro de Control y Diagnóstico de DashEyes (V2.0)
+dashboard.py - Centro de Control y Diagnóstico de DashEyes (V2.0 Final)
 Punto de entrada visual con QSystemTrayIcon, InstallWorker asíncrono con
-cancelación segura, y verificación estricta de Administrador.
+cancelación segura, verificación estricta de Administrador y taskkill en árbol.
 """
 
 import sys
@@ -408,12 +408,13 @@ class DashEyesDashboard(QMainWindow):
         event.accept()
 
     def _force_exit(self):
+        """BUG-01 Corregido: Finaliza el árbol de procesos completo en Windows con taskkill /T /F."""
         if self.dash_process is not None and self.dash_process.poll() is None:
-            self.dash_process.terminate()
+            pid = self.dash_process.pid
             try:
-                self.dash_process.wait(timeout=2.0)
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
             except Exception:
-                pass
+                self.dash_process.terminate()
         self.tray_icon.hide()
         QApplication.quit()
 

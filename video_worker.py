@@ -1,8 +1,6 @@
 """
-video_worker.py - Módulo B: Motor de Video y Contacto Visual Blindado (V2.0 Engine)
-Incluye Threaded Frame Grabber con Frame ID Atómico, Sincronización vcam,
-Reset Adaptativo de EMA, Compuerta Head-Pose 3D, soporte para Pipes IPC
-y blindaje de recursos DirectShow ante BaseException.
+video_worker.py - Módulo B: Motor de Video y Contacto Visual Blindado (V2.0 Final)
+BUG-03 Corregido: Registro explícito de excepciones y trazado de fallos sin supresión ciega.
 """
 
 import sys
@@ -10,6 +8,7 @@ import time
 import queue
 import signal
 import threading
+import traceback
 from multiprocessing import Queue
 from multiprocessing.connection import Connection
 import cv2
@@ -31,12 +30,12 @@ LEFT_IRIS_CENTER = 468
 RIGHT_IRIS_CENTER = 473
 
 CANONICAL_FACE_3D = np.array([
-    (0.0, 0.0, 0.0),             # Punta de la nariz (Landmark 1)
-    (0.0, -330.0, -65.0),        # Barbilla (Landmark 152)
-    (-225.0, 170.0, -135.0),     # Esquina externa ojo izquierdo (Landmark 33)
-    (225.0, 170.0, -135.0),      # Esquina externa ojo derecho (Landmark 263)
-    (-150.0, -150.0, -125.0),    # Comisura izquierda de la boca (Landmark 61)
-    (150.0, -150.0, -125.0)      # Comisura derecha de la boca (Landmark 291)
+    (0.0, 0.0, 0.0),
+    (0.0, -330.0, -65.0),
+    (-225.0, 170.0, -135.0),
+    (225.0, 170.0, -135.0),
+    (-150.0, -150.0, -125.0),
+    (150.0, -150.0, -125.0)
 ], dtype=np.float64)
 
 
@@ -280,7 +279,7 @@ class EyeContactEngine:
 
 
 # ==============================================================================
-# BUCLE PRINCIPAL CON PROTECCIÓN ANTE BaseException Y SOPORTE PIPES
+# BUCLE PRINCIPAL CON DIAGNÓSTICO DE EXCEPCIONES Y PROTOCOLO LIMPIO
 # ==============================================================================
 
 def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, width=1280, height=720, fps=30):
@@ -315,7 +314,6 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
             vcam_instance = vcam
 
             while not stop_event.is_set():
-                # 1. Comprobación por Pipe (Unidireccional Directo - Recomendado)
                 if cmd_pipe is not None:
                     try:
                         if cmd_pipe.poll():
@@ -332,7 +330,6 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
                     except Exception:
                         pass
 
-                # 2. Comprobación retrocompatible por Queue
                 elif ipc_queue is not None:
                     try:
                         msg = ipc_queue.get_nowait()
@@ -370,10 +367,12 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
                 vcam.sleep_until_next_frame()
 
     except BaseException as critical_err:
-        pass
+        # BUG-03 Corregido: Trazado explícito de errores sin supresión ciega
+        if not isinstance(critical_err, (KeyboardInterrupt, SystemExit)):
+            print(f"[VIDEO WORKER ERROR CRÍTICO] {critical_err}", file=sys.stderr)
+            traceback.print_exc()
 
     finally:
-        # Desmontaje atómico blindado de hardware y descriptores
         grabber.stop()
         face_mesh.close()
         if vcam_instance is not None:
@@ -382,7 +381,6 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
             except Exception:
                 pass
 
-        # Notificación Handshake ACK al orquestador
         if ack_pipe is not None:
             try:
                 ack_pipe.send({"cmd": "ACK_STOP"})

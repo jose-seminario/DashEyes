@@ -1,7 +1,7 @@
 """
 teleprompter_ui.py - Módulo A: Teleprompter Invisible para Windows (PyQt6)
 Diseñado para operar como proceso independiente o autónomo dentro de DashEyes.
-Incluye re-aplicación reactiva de WDA_EXCLUDEFROMCAPTURE en moveEvent y screenChanged.
+BUG-02 Corregido: Detección geográfica de cambio de pantalla en moveEvent sin saturación Win32.
 """
 
 import sys
@@ -19,16 +19,10 @@ from PyQt6.QtWidgets import (
     QLabel,
 )
 
-# Constante de la API de Windows 10 (Build 19041+) y Windows 11
-# Excluye la superficie de la ventana de las texturas de captura de DWM
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
 
 def set_window_capture_invisibility(hwnd: int) -> bool:
-    """
-    Configura la afinidad de la ventana con la API nativa de Windows (User32).
-    Aplica WDA_EXCLUDEFROMCAPTURE para ocultar la ventana en Zoom, Teams, Meet y OBS.
-    """
     try:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         SetWindowDisplayAffinity = user32.SetWindowDisplayAffinity
@@ -37,10 +31,9 @@ def set_window_capture_invisibility(hwnd: int) -> bool:
 
         result = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
         if not result:
-            err = ctypes.get_last_error()
             return False
         return True
-    except Exception as e:
+    except Exception:
         return False
 
 
@@ -54,6 +47,7 @@ class InvisibleTeleprompter(QMainWindow):
         self.base_interval_ms = 40
         self._drag_pos = None
         self._screen_listener_connected = False
+        self._current_screen = None  # Cache de pantalla para BUG-02
 
         self._init_window_properties()
         self._init_ui_components()
@@ -136,20 +130,24 @@ class InvisibleTeleprompter(QMainWindow):
         super().showEvent(event)
         hwnd = int(self.winId())
         set_window_capture_invisibility(hwnd)
+        self._current_screen = self.screen()
 
-        # Enlazar evento screenChanged para reconfiguraciones de DWM/DPI
         if not self._screen_listener_connected and self.windowHandle() is not None:
             self.windowHandle().screenChanged.connect(self._on_screen_changed)
             self._screen_listener_connected = True
 
     def moveEvent(self, event):
-        """Re-aplica WDA_EXCLUDEFROMCAPTURE cada vez que la ventana cruza monitores."""
+        """BUG-02 Corregido: Solo invoca Win32 si la ventana realmente cruzó a otro monitor."""
         super().moveEvent(event)
-        hwnd = int(self.winId())
-        set_window_capture_invisibility(hwnd)
+        new_screen = self.screen()
+        if new_screen != self._current_screen:
+            self._current_screen = new_screen
+            hwnd = int(self.winId())
+            set_window_capture_invisibility(hwnd)
 
     def _on_screen_changed(self, screen):
-        """Callback cuando Windows DWM transfiere la superficie a otro monitor."""
+        """Callback oficial de cambio de pantalla en Qt."""
+        self._current_screen = screen
         hwnd = int(self.winId())
         set_window_capture_invisibility(hwnd)
 
