@@ -15,6 +15,7 @@ import ctypes
 import subprocess
 import webbrowser
 import importlib
+import config_manager
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
@@ -31,6 +32,8 @@ from PyQt6.QtWidgets import (
     QSystemTrayIcon,
     QMenu,
     QFileDialog,
+    QSlider,
+    QCheckBox,
 )
 
 
@@ -122,7 +125,7 @@ class DashEyesDashboard(QMainWindow):
 
     def _init_window(self):
         self.setWindowTitle("DashEyes - Centro de Control V2.0")
-        self.setFixedSize(580, 620)
+        self.setFixedSize(580, 710)
         self.setStyleSheet("""
             QMainWindow { background-color: #0F172A; }
             QWidget { color: #E2E8F0; font-family: 'Segoe UI', Arial, sans-serif; }
@@ -228,6 +231,70 @@ class DashEyesDashboard(QMainWindow):
         script_box.addLayout(script_btn_layout)
         layout.addLayout(script_box)
 
+        # Calibración de Contacto Visual (Nivel 1 con Feature Flag)
+        self.config = config_manager.load_config()
+        self.enable_level1 = self.config.get("enable_level1_controls", True)
+
+        if self.enable_level1:
+            self.calibration_frame = QFrame()
+            self.calibration_frame.setStyleSheet("""
+                QFrame {
+                    background-color: #1E293B;
+                    border: 1px solid #334155;
+                    border-radius: 8px;
+                    padding: 4px;
+                }
+            """)
+            cal_layout = QVBoxLayout(self.calibration_frame)
+            cal_layout.setContentsMargins(12, 10, 12, 10)
+            cal_layout.setSpacing(8)
+
+            cal_header = QHBoxLayout()
+            cal_title = QLabel("Calibración de Contacto Visual:")
+            cal_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #38BDF8;")
+            cal_header.addWidget(cal_title)
+
+            self.cal_reset_btn = QPushButton("Restablecer")
+            self.cal_reset_btn.setFixedSize(76, 22)
+            self.cal_reset_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #334155;
+                    color: #94A3B8;
+                    font-size: 10px;
+                    font-weight: 600;
+                    border-radius: 4px;
+                    border: 1px solid #475569;
+                }
+                QPushButton:hover { background-color: #475569; color: #F8FAFC; }
+            """)
+            self.cal_reset_btn.clicked.connect(self.on_reset_calibration_clicked)
+            cal_header.addWidget(self.cal_reset_btn)
+            cal_layout.addLayout(cal_header)
+
+            slider_row = QHBoxLayout()
+            self.intensity_slider = QSlider(Qt.Orientation.Horizontal)
+            self.intensity_slider.setRange(0, 100)
+            initial_intensity = self.config.get("eye_contact", {}).get("intensity", 50)
+            self.intensity_slider.setValue(initial_intensity)
+            self.intensity_slider.valueChanged.connect(self.on_intensity_slider_changed)
+
+            self.intensity_label = QLabel()
+            self.intensity_label.setStyleSheet("font-size: 11px; color: #E2E8F0; font-weight: 600; min-width: 140px;")
+            self._update_intensity_label(initial_intensity)
+
+            slider_row.addWidget(self.intensity_slider, 1)
+            slider_row.addWidget(self.intensity_label)
+            cal_layout.addLayout(slider_row)
+
+            self.toggle_checkbox = QCheckBox("Activar corrección de mirada")
+            self.toggle_checkbox.setStyleSheet("font-size: 11px; color: #CBD5E1; font-weight: 500;")
+            initial_enabled = self.config.get("eye_contact", {}).get("enabled", True)
+            self.toggle_checkbox.setChecked(initial_enabled)
+            self.toggle_checkbox.toggled.connect(self.on_toggle_checkbox_changed)
+            cal_layout.addWidget(self.toggle_checkbox)
+
+            layout.addWidget(self.calibration_frame)
+
         layout.addStretch()
 
         # Botón de Reparación con UAC Bajo Demanda
@@ -325,6 +392,32 @@ class DashEyesDashboard(QMainWindow):
         row.addWidget(status_badge)
         return (row, status_badge)
 
+    def _update_intensity_label(self, val):
+        if val == 0:
+            desc = "0% (Desactivado)"
+        elif val < 30:
+            desc = f"{val}% (Sutil)"
+        elif val <= 70:
+            desc = f"{val}% (Equilibrado)"
+        else:
+            desc = f"{val}% (Pronunciado)"
+        if hasattr(self, "intensity_label"):
+            self.intensity_label.setText(f"Intensidad: {desc}")
+
+    def on_intensity_slider_changed(self, val):
+        self._update_intensity_label(val)
+        config_manager.update_eye_contact_config(intensity=val)
+
+    def on_toggle_checkbox_changed(self, checked):
+        config_manager.update_eye_contact_config(enabled=checked)
+
+    def on_reset_calibration_clicked(self):
+        if hasattr(self, "intensity_slider") and hasattr(self, "toggle_checkbox"):
+            self.intensity_slider.setValue(50)
+            self.toggle_checkbox.setChecked(True)
+            self._update_intensity_label(50)
+            config_manager.update_eye_contact_config(intensity=50, enabled=True)
+
     def on_select_script_clicked(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -397,6 +490,11 @@ class DashEyesDashboard(QMainWindow):
         # El modo Teleprompter SIEMPRE está habilitado
         self.launch_teleprompter_btn.setEnabled(True)
 
+        # Control de habilitación del panel de calibración de Eye Contact
+        if getattr(self, "enable_level1", False) and hasattr(self, "calibration_frame"):
+            can_eye = bool(res["obs_driver_ok"] and res["packages_ok"])
+            self.calibration_frame.setEnabled(can_eye)
+
     def on_repair_clicked(self):
         """Elevación de UAC bajo demanda usando ShellExecuteW 'runas' solo si no es admin."""
         is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
@@ -449,6 +547,9 @@ class DashEyesDashboard(QMainWindow):
 
     def on_launch_teleprompter_clicked(self):
         """Lanza exclusivamente el Modo Teleprompter (Liviano / Sin OBS / Sin Admin)."""
+        if getattr(self, "enable_level1", False) and hasattr(self, "calibration_frame"):
+            self.calibration_frame.setEnabled(False)
+
         main_py = os.path.join(os.path.dirname(__file__), "main.py")
         cmd = [sys.executable, main_py, "--mode", "teleprompter"]
         if self.selected_script_path:
@@ -472,6 +573,12 @@ class DashEyesDashboard(QMainWindow):
         cmd = [sys.executable, main_py, "--mode", "eye_contact"]
         if self.selected_script_path:
             cmd.extend(["--script", self.selected_script_path])
+
+        if getattr(self, "enable_level1", False) and hasattr(self, "intensity_slider"):
+            cmd.extend([
+                "--intensity", str(self.intensity_slider.value()),
+                "--eye-contact-enabled", "1" if self.toggle_checkbox.isChecked() else "0"
+            ])
 
         try:
             self.dash_process = subprocess.Popen(cmd)
