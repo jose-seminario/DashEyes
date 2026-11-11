@@ -106,16 +106,29 @@ def calculate_shifts(intensity):
     return round(factor * 10, 1), round(factor * 2, 1)
 
 
+def level1_controls_enabled(data=None):
+    """Indica si los controles manuales de nivel 1 están habilitados en la configuración."""
+    source = normalize_config(data) if isinstance(data, dict) else load_config()
+    return bool(source.get("enable_level1_controls", True))
+
+
 @contextmanager
 def file_lock(name="config.lock", timeout=0.6):
-    """Nunca continúa sin bloqueo. No trunca un archivo de cerrojo existente."""
+    """Nunca continúa sin bloqueo. Incluye la espera del cerrojo local en el plazo."""
     os.makedirs(get_data_dir(), exist_ok=True)
+    deadline = time.monotonic() + max(0.0, float(timeout))
     with _LOCK_REGISTRY:
-        local_lock = _LOCAL_LOCKS.setdefault(name, threading.RLock())
-    with local_lock:
+        local_lock = _LOCAL_LOCKS.setdefault(name, threading.Lock())
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        acquired_local = local_lock.acquire(blocking=False)
+    else:
+        acquired_local = local_lock.acquire(blocking=True, timeout=remaining)
+    if not acquired_local:
+        raise ConfigError("Otro proceso está usando los ajustes o la sesión.")
+    try:
         handle = open(os.path.join(get_data_dir(), name), "a+b")
         acquired = False
-        deadline = time.monotonic() + timeout
         try:
             while True:
                 try:
@@ -130,7 +143,7 @@ def file_lock(name="config.lock", timeout=0.6):
                 except OSError as exc:
                     if time.monotonic() >= deadline:
                         raise ConfigError("Otro proceso está usando los ajustes o la sesión.") from exc
-                    time.sleep(0.02)
+                    time.sleep(min(0.02, max(0.001, deadline - time.monotonic())))
             yield
         finally:
             try:
@@ -143,6 +156,8 @@ def file_lock(name="config.lock", timeout=0.6):
                         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             finally:
                 handle.close()
+    finally:
+        local_lock.release()
 
 
 def _read_unlocked(strict=False):
