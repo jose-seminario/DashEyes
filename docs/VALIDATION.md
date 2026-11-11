@@ -19,10 +19,18 @@ La suite usa `unittest` y cubre:
 - Conservación de píxeles fuera del ojo.
 - Propiedad de captura y liberación en el mismo hilo con una cámara simulada.
 - Interfaz offscreen: controles, modo lectura y conservación del guion ante errores.
+- Orden de carga nativa anterior a Qt y conservación del fallo si una DLL no carga.
+- CLI de diagnóstico sin cámara y recolección explícita de DLL en el empaquetado.
 
 Los módulos que necesitan Qt/OpenCV se omiten si faltan sus dependencias; una
 ejecución con omisiones no valida esas áreas. El workflow completo instala las
 dependencias declaradas antes de ejecutar la suite. No requiere webcam.
+
+CI también importa las dependencias sin empaquetar antes del build y dentro del
+exe después. Ambas comprobaciones usan `--no-camera`. Si falla, compartir la
+salida JSON y el artefacto `DashEyes-build-diagnostics`, que incluye el inventario
+de DLL/PYD y las advertencias de PyInstaller. Un error de `_framework_bindings`
+durante importación no demuestra ausencia de webcam ni de OBS.
 
 ## Comprobaciones manuales en Windows
 

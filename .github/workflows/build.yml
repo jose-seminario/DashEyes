@@ -35,15 +35,27 @@ jobs:
         QT_QPA_PLATFORM: offscreen
       run: python -m unittest discover -s tests -v
 
+    - name: Native dependency preflight before packaging (no camera)
+      run: python main.py --diagnose --no-camera
+
     - name: Build Executable with PyInstaller
       run: |
         python -m PyInstaller --noconfirm pyinstaller.spec
+
+    - name: Record packaged native library inventory
+      run: |
+        $root = (Resolve-Path '.\dist\DashEyes').Path
+        Get-ChildItem -Path $root -Recurse -File |
+          Where-Object { $_.Extension -in @('.dll', '.pyd') } |
+          ForEach-Object { $_.FullName.Substring($root.Length + 1) } |
+          Sort-Object |
+          Set-Content -Path (Join-Path $env:RUNNER_TEMP 'dasheyes-native-libraries.log')
 
     - name: Packaged dispatch smoke test (no webcam)
       run: |
         $stdout = Join-Path $env:RUNNER_TEMP 'dasheyes-diagnose-stdout.log'
         $stderr = Join-Path $env:RUNNER_TEMP 'dasheyes-diagnose-stderr.log'
-        $p = Start-Process -FilePath '.\dist\DashEyes\DashEyes.exe' -ArgumentList '--diagnose' -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        $p = Start-Process -FilePath '.\dist\DashEyes\DashEyes.exe' -ArgumentList '--diagnose', '--no-camera' -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
         # Conservar el handle antes de que termine un proceso de vida corta.
         $handle = $p.Handle
         if (-not $p.WaitForExit(20000)) {
@@ -81,6 +93,7 @@ jobs:
         include-hidden-files: true
         path: |
           ${{ runner.temp }}/dasheyes-diagnose-*.log
+          ${{ runner.temp }}/dasheyes-native-libraries.log
           build/**/warn-*.txt
           dist/DashEyes/.dasheyes/logs/*.log
           dist/DashEyes/_internal/.dasheyes/logs/*.log

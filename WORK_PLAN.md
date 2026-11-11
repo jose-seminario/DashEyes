@@ -53,8 +53,20 @@ por PowerShell. No se da por corregida la causa raíz.
 
 Se preparó captura de stdout/stderr, conservación del handle del proceso,
 comprobación explícita del ExitCode y del informe JSON y publicación de los logs
-incluso si el paso falla. Este ajuste requiere un nuevo commit/push autorizado;
+incluso si el paso falla. Ese ajuste se publicó en `dd84381` con autorización;
 no se han ejecutado pruebas en el equipo universitario.
+
+El siguiente informe remoto confirmó ExitCode 1 y un fallo al inicializar
+`mediapipe.python._framework_bindings`; las otras cuatro dependencias cargaron.
+No es un fallo de webcam: ocurrió antes de comprobar dispositivos.
+
+Se preparó la recolección explícita de DLL de MediaPipe y bibliotecas delvewheel,
+un runtime hook con rutas internas de carga y un diagnóstico que importa los
+componentes de vídeo antes de Qt. CI ahora comprueba los imports sin empaquetar
+antes de construir y vuelve a comprobarlos dentro del exe, con `--no-camera`.
+También conserva el inventario de DLL/PYD. Se añadieron cuatro pruebas de
+regresión (37 en total). Esta corrección sigue pendiente de validación remota;
+no se ha identificado la DLL concreta que falló ni se declara resuelto sin CI.
 
 - No se promete mirada perfecta, invisibilidad universal ni FPS sin mediciones.
 - El efecto queda sin aplicar hasta calibrar. La referencia no se reutiliza entre

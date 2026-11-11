@@ -38,6 +38,15 @@ class ArchitectureTests(unittest.TestCase):
         self.assertEqual(len(analyses), 1)
         self.assertEqual(ast.literal_eval(analyses[0].args[0]), ["dashboard.py"])
 
+    def test_packaging_collects_mediapipe_native_libraries(self):
+        tree = ast.parse((ROOT / "pyinstaller.spec").read_text(encoding="utf-8"))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
+        self.assertTrue(any(node.func.id == "collect_dynamic_libs" and node.args and ast.literal_eval(node.args[0]) == "mediapipe" for node in calls))
+        self.assertTrue(any(node.func.id == "collect_delvewheel_libs_directory" for node in calls))
+        analysis = next(node for node in calls if node.func.id == "Analysis")
+        hooks = next(keyword.value for keyword in analysis.keywords if keyword.arg == "runtime_hooks")
+        self.assertIn("pyi_rth_native_paths.py", ast.literal_eval(hooks))
+
     def test_python_sources_parse(self):
         for path in ROOT.rglob("*.py"):
             if any(part in {".git", ".dasheyes", "build", "dist", ".venv"} for part in path.parts):

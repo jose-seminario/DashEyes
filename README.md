@@ -125,6 +125,12 @@ parada independiente; en Windows, un Job Object limita los procesos huérfanos s
 desaparece el padre. Un controlador nativo bloqueado puede requerir terminación
 de respaldo: no se garantiza eliminar fallos internos de drivers.
 
+El paquete recoge explícitamente bibliotecas nativas de MediaPipe, incluidas las
+carpetas auxiliares de wheels Windows cuando existan. Un runtime hook registra
+solo rutas internas del paquete, sin instalar runtimes ni modificar el PATH del
+sistema. El diagnóstico de CI usa `--diagnose --no-camera`: verifica imports
+nativos primero en Python y luego en el ejecutable, sin abrir dispositivos.
+
 Consulta [validación](docs/VALIDATION.md), [plan de trabajo](WORK_PLAN.md) y
 [dependencias y licencias](docs/THIRD_PARTY.md). La integración continua está
 preparada para pruebas sin cámara y compilación; no ha sido ejecutada durante

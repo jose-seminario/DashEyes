@@ -31,7 +31,12 @@ def parse_arguments(argv=None):
     parser.add_argument("--intensity", type=int)
     parser.add_argument("--eye-contact-enabled", type=int, choices=[0, 1])
     parser.add_argument("--dashboard", action="store_true", help="Recibir JSON por stdin")
-    return parser.parse_args(argv)
+    parser.add_argument("--diagnose", action="store_true", help="Comprobar dependencias y salir")
+    parser.add_argument("--no-camera", action="store_true", help="Diagnóstico sin abrir cámara virtual")
+    args = parser.parse_args(argv)
+    if args.no_camera and not args.diagnose:
+        parser.error("--no-camera requiere --diagnose")
+    return args
 
 
 def emit(message):
@@ -233,12 +238,12 @@ def supervise(args):
 
 def main(argv=None):
     restore_redirected_stdio()
-    if (sys.argv[1:] if argv is None else argv) == ["--diagnose"]:
+    args = parse_arguments(argv)
+    if args.diagnose:
         from diagnostics import diagnose
-        result = diagnose()
+        result = diagnose(check_camera=not args.no_camera)
         emit(result)
         return 0 if result["packages_ok"] else 1
-    args = parse_arguments(argv)
     try:
         with config_manager.file_lock("session.lock", timeout=0):
             return supervise(args)
