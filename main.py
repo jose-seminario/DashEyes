@@ -18,7 +18,7 @@ import threading
 import time
 
 import config_manager
-from protocol import drain, offer, valid_command
+from protocol import coalesce_commands, drain, offer, offer_latest, valid_command
 from runtime import ProcessJob, get_logger, restore_redirected_stdio
 
 
@@ -85,6 +85,8 @@ def _read_dashboard(incoming, stop):
         return
     try:
         for line in sys.stdin:
+            if stop.is_set():
+                return
             if len(line) > 4096:
                 continue
             try:
@@ -94,8 +96,11 @@ def _read_dashboard(incoming, stop):
             if valid_command(message):
                 if message["cmd"] == "STOP":
                     stop.set()
-                else:
+                    return
+                if not offer_latest(incoming, message):
                     offer(incoming, message)
+    except (OSError, ValueError):
+        pass
     finally:
         stop.set()  # También al desaparecer el Dashboard.
 
@@ -104,6 +109,7 @@ def supervise(args):
     logger = get_logger("session")
     context = mp.get_context("spawn")
     stop = context.Event()
+    signal_stop = threading.Event()
     incoming = queue.Queue(maxsize=128)
     ui_commands = context.Queue(maxsize=128)
     video_commands = context.Queue(maxsize=128)
@@ -114,6 +120,7 @@ def supervise(args):
     processes = []
     job = None
     exit_code = 0
+    emitted_error = False
     settings = config_manager.load_config()
     # Los argumentos son ajustes de esta sesión, no sobrescriben preferencias.
     if args.camera is not None:
@@ -129,9 +136,10 @@ def supervise(args):
     ready = not eye_mode
     ui_ready = False
     started = time.monotonic()
+    last_video_heartbeat = started
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, lambda *_: stop.set())
+            signal.signal(sig, lambda *_: signal_stop.set())
         job = ProcessJob()
         if args.dashboard:
             threading.Thread(target=_read_dashboard, args=(incoming, stop), daemon=True).start()
@@ -153,15 +161,22 @@ def supervise(args):
         job.add(ui)
         emit({"type": "STARTING", "mode": args.mode})
         while not stop.wait(0.03):
+            if signal_stop.is_set():
+                stop.set()
+                break
             for channel in (incoming, ui_commands):
-                for message in drain(channel):
+                for message in coalesce_commands(list(drain(channel))):
                     if isinstance(message, dict) and message.get("type") == "UI_READY":
                         ui_ready = True
                         if not eye_mode:
                             emit({"type": "READY", "message": "Teleprompter listo; lectura pausada."})
                         continue
+                    if isinstance(message, dict) and message.get("type") == "WARNING":
+                        emit(message)
+                        continue
                     if isinstance(message, dict) and message.get("type") == "ERROR":
                         emit(message)
+                        emitted_error = True
                         exit_code = 1
                         stop.set()
                         continue
@@ -169,16 +184,20 @@ def supervise(args):
                         continue
                     if message["cmd"] == "STOP":
                         stop.set()
-                    elif eye_mode and not offer(video_commands, message):
-                        warning = {"type": "WARNING", "message": "Control no enviado; vuelve a intentarlo."}
-                        emit(warning)
-                        offer(ui_events, warning)
+                    elif eye_mode:
+                        sent = offer_latest(video_commands, message) if message["cmd"] in {"SET_INTENSITY", "TOGGLE_CORRECTION", "PREVIEW"} else offer(video_commands, message)
+                        if not sent:
+                            warning = {"type": "WARNING", "reconcile": True, "message": "Control no enviado; vuelve a intentarlo."}
+                            emit(warning)
+                            offer_latest(ui_events, warning)
             for message in drain(video_events):
+                last_video_heartbeat = time.monotonic()
                 emit(message)
-                offer(ui_events, message)
+                offer_latest(ui_events, message)
                 if message.get("type") == "READY":
                     ready = True
                 elif message.get("type") == "ERROR":
+                    emitted_error = True
                     exit_code = 1
                     stop.set()
             if not ui.is_alive():
@@ -187,15 +206,24 @@ def supervise(args):
             if eye_mode and not video.is_alive():
                 if not stop.is_set():
                     emit({"type": "ERROR", "message": "El motor de vídeo terminó inesperadamente."})
+                    emitted_error = True
                     exit_code = 1
                 stop.set()
-            if (not ready or not ui_ready) and time.monotonic() - started > 30:
+            now = time.monotonic()
+            if (not ready or not ui_ready) and now - started > 30:
                 emit({"type": "ERROR", "message": "La cámara o el motor no respondió en 30 segundos."})
+                emitted_error = True
+                exit_code = 1
+                stop.set()
+            elif eye_mode and ready and now - last_video_heartbeat > 12:
+                emit({"type": "ERROR", "message": "El motor de vídeo dejó de responder."})
+                emitted_error = True
                 exit_code = 1
                 stop.set()
     except Exception as exc:
         logger.exception("Error de sesión")
         emit({"type": "ERROR", "message": str(exc)})
+        emitted_error = True
         exit_code = 1
     finally:
         stop.set()
@@ -203,6 +231,7 @@ def supervise(args):
         while time.monotonic() < deadline and any(p.is_alive() for p in processes):
             for message in drain(video_events):
                 if message.get("type") == "ERROR":
+                    emitted_error = True
                     exit_code = 1
                 emit(message)
             time.sleep(0.03)
@@ -217,18 +246,22 @@ def supervise(args):
         if job is not None:
             job.close()
         for message in drain(ui_commands):
-            if isinstance(message, dict) and message.get("type") == "ERROR":
+            if isinstance(message, dict) and message.get("type") in ("ERROR", "WARNING"):
                 emit(message)
-                exit_code = 1
-        for process in processes:
-            if process.exitcode not in (0, None):
-                if not exit_code:
-                    emit({"type": "ERROR", "message": f"{process.name} terminó con error. Revisa el registro local."})
-                exit_code = 1
+                if message.get("type") == "ERROR":
+                    emitted_error = True
+                    exit_code = 1
         for message in drain(video_events):
             if message.get("type") == "ERROR":
+                emitted_error = True
                 exit_code = 1
             emit(message)
+        for process in processes:
+            if process.exitcode not in (0, None):
+                if not emitted_error:
+                    emit({"type": "ERROR", "message": f"{process.name} terminó con error. Revisa el registro local."})
+                    emitted_error = True
+                exit_code = 1
         for channel in channels:
             channel.cancel_join_thread()
             channel.close()

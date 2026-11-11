@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
 )
 
 import config_manager
-from protocol import drain, offer
+from protocol import drain, offer, offer_latest
 from settings_writer import SettingsWriter
 
 WDA_EXCLUDEFROMCAPTURE = 0x11
@@ -43,8 +43,14 @@ class InvisibleTeleprompter(QMainWindow):
         self.scroll_speed = tele["scroll_speed"]
         self.font_size = tele["font_size"]
         self.opacity = tele["opacity"]
+        self._applied_intensity = self.config["eye_contact"]["intensity"]
+        self._applied_enabled = self.config["eye_contact"]["enabled"]
+        self._pending_intensity = None
+        self._pending_enabled = None
+        self._applied_preview = False
         self.is_paused = True
         self._closing = False
+        self._force_discard = False
         self._drag_pos = None
         self._hotkeys = set()
         self._screen_connected = False
@@ -197,10 +203,33 @@ class InvisibleTeleprompter(QMainWindow):
             self.notice_label.setStyleSheet("color: #94A3B8")
 
     def _send(self, message):
-        if not offer(self.commands, message):
+        cmd = message.get("cmd") if isinstance(message, dict) else None
+        sent = offer_latest(self.commands, message) if cmd in {"SET_INTENSITY", "TOGGLE_CORRECTION", "PREVIEW"} else offer(self.commands, message)
+        if not sent:
             self.notice_label.setText("No se pudo enviar el control; vuelve a intentarlo.")
             return False
         return True
+
+    def _reconcile_eye_controls(self, intensity=None, enabled=None):
+        if intensity is not None and hasattr(self, "eye_slider"):
+            self._applied_intensity = int(intensity)
+            if self._pending_intensity == self._applied_intensity:
+                self._pending_intensity = None
+            if self._pending_intensity is None and not self.eye_slider.isSliderDown() and self.eye_slider.value() != self._applied_intensity:
+                self.eye_slider.blockSignals(True)
+                self.eye_slider.setValue(self._applied_intensity)
+                self.eye_slider.blockSignals(False)
+                if hasattr(self, "_slider_labels") and self.eye_slider in self._slider_labels:
+                    label_widget, prefix = self._slider_labels[self.eye_slider]
+                    label_widget.setText(f"{prefix}: {self._applied_intensity}")
+        if enabled is not None and hasattr(self, "eye_checkbox"):
+            self._applied_enabled = bool(enabled)
+            if self._pending_enabled == self._applied_enabled:
+                self._pending_enabled = None
+            if self._pending_enabled is None and self.eye_checkbox.isChecked() != self._applied_enabled:
+                self.eye_checkbox.blockSignals(True)
+                self.eye_checkbox.setChecked(self._applied_enabled)
+                self.eye_checkbox.blockSignals(False)
 
     def _font_changed(self, value):
         self.font_size = value
@@ -240,17 +269,31 @@ class InvisibleTeleprompter(QMainWindow):
 
     def _intensity_changed(self, value):
         if self._send({"cmd": "SET_INTENSITY", "intensity": value}):
+            self._pending_intensity = value
             self.writer.submit({"eye_contact": {"intensity": value}})
+        else:
+            self._pending_intensity = None
+            self._reconcile_eye_controls(intensity=self._applied_intensity)
 
     def _eye_toggled(self, enabled):
         if self._send({"cmd": "TOGGLE_CORRECTION", "enabled": enabled}):
+            self._pending_enabled = enabled
             self.writer.submit({"eye_contact": {"enabled": enabled}})
+        else:
+            self._pending_enabled = None
+            self._reconcile_eye_controls(enabled=self._applied_enabled)
 
     def _preview_toggled(self, enabled):
-        self.preview_container.setVisible(enabled)
-        self._send({"cmd": "PREVIEW", "enabled": enabled})
-        if not enabled:
-            self.preview_label.clear()
+        if self._send({"cmd": "PREVIEW", "enabled": enabled}):
+            self._applied_preview = enabled
+            self.preview_container.setVisible(enabled)
+            if not enabled:
+                self.preview_label.clear()
+        elif hasattr(self, "preview_checkbox"):
+            self.preview_checkbox.blockSignals(True)
+            self.preview_checkbox.setChecked(self._applied_preview)
+            self.preview_checkbox.blockSignals(False)
+            self.preview_container.setVisible(self._applied_preview)
 
     def _scroll_tick(self):
         scrollbar = self.text_editor.verticalScrollBar()
@@ -287,8 +330,16 @@ class InvisibleTeleprompter(QMainWindow):
                 color = "#22C55E" if state in ("CORRECTING", "NATURAL") else "#FBBF24"
                 self.led_badge.setStyleSheet(f"color: {color}")
                 self.status_label.setText(f"{message.get('message', '')}  {message.get('fps', 0)} FPS · {message.get('processing_ms', 0)} ms")
+                self._reconcile_eye_controls(
+                    intensity=message.get("intensity") if isinstance(message.get("intensity"), int) else None,
+                    enabled=message.get("enabled") if isinstance(message.get("enabled"), bool) else None,
+                )
             elif kind in ("WARNING", "ERROR", "READY"):
                 self.status_label.setText(message.get("message", ""))
+                if kind == "WARNING" and message.get("reconcile"):
+                    self._pending_intensity = None
+                    self._pending_enabled = None
+                    self._reconcile_eye_controls(intensity=self._applied_intensity, enabled=self._applied_enabled)
         image = None
         for data in drain(self.previews, limit=2):
             image = data
@@ -326,6 +377,8 @@ class InvisibleTeleprompter(QMainWindow):
                 return
 
     def eventFilter(self, obj, event):
+        if self._closing:
+            return super().eventFilter(obj, event)
         if self.isActiveWindow() and event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress):
             key = event.key()
             actions = {Qt.Key.Key_Space: self._toggle_pause, Qt.Key.Key_Escape: self.close,
@@ -411,6 +464,8 @@ class InvisibleTeleprompter(QMainWindow):
     def closeEvent(self, event):
         if not self._closing:
             self._closing = True
+            self.poll_timer.stop()
+            self.scroll_timer.stop()
             self.centralWidget().setEnabled(False)
             self.geometry_timer.stop()
             self._save_geometry()
@@ -418,6 +473,40 @@ class InvisibleTeleprompter(QMainWindow):
         if self.writer.isRunning():
             event.ignore()
             return
+        if self.writer.has_unsaved_changes() and not self._force_discard:
+            if not self.writer.flush_sync():
+                forced_by_supervisor = self.stop is not None and self.stop.is_set()
+                if not forced_by_supervisor and self.isVisible():
+                    box = QMessageBox(self)
+                    box.setIcon(QMessageBox.Icon.Warning)
+                    box.setWindowTitle("Ajustes sin guardar")
+                    box.setText(f"No se pudieron guardar los últimos ajustes.\n{self.writer.last_error}")
+                    retry_btn = box.addButton("Reintentar", QMessageBox.ButtonRole.AcceptRole)
+                    discard_btn = box.addButton("Cerrar sin guardar", QMessageBox.ButtonRole.DestructiveRole)
+                    cancel_btn = box.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+                    box.exec()
+                    clicked = box.clickedButton()
+                    if clicked == retry_btn and self.writer.flush_sync():
+                        pass
+                    elif clicked == cancel_btn or (clicked == retry_btn and self.writer.has_unsaved_changes()):
+                        self._closing = False
+                        self.centralWidget().setEnabled(True)
+                        self.writer = SettingsWriter(self)
+                        self.writer.saved.connect(self._settings_saved)
+                        self.writer.finished.connect(self._writer_finished)
+                        self.writer.start()
+                        self.poll_timer.start(100)
+                        self.scroll_timer.start()
+                        event.ignore()
+                        return
+                    elif clicked == discard_btn:
+                        self._force_discard = True
+                        offer(self.commands, {"type": "WARNING", "message": "Teleprompter cerrado descartando ajustes no guardados."})
+                        self.writer.discard_unsaved()
+                else:
+                    self._force_discard = True
+                    offer(self.commands, {"type": "ERROR", "message": "No se pudieron guardar los ajustes finales del teleprompter."})
+                    self.writer.discard_unsaved()
         self.poll_timer.stop()
         self.scroll_timer.stop()
         QApplication.instance().removeEventFilter(self)
