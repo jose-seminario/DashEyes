@@ -39,6 +39,8 @@ jobs:
       run: python main.py --diagnose --no-camera
 
     - name: Build Executable with PyInstaller
+      env:
+        DASHEYES_BUILD_CONSOLE_PROBE: '1'
       run: |
         python -m PyInstaller --noconfirm pyinstaller.spec
 
@@ -53,36 +55,58 @@ jobs:
 
     - name: Packaged dispatch smoke test (no webcam)
       run: |
-        $stdout = Join-Path $env:RUNNER_TEMP 'dasheyes-diagnose-stdout.log'
-        $stderr = Join-Path $env:RUNNER_TEMP 'dasheyes-diagnose-stderr.log'
-        $p = Start-Process -FilePath '.\dist\DashEyes\DashEyes.exe' -ArgumentList '--diagnose', '--no-camera' -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-        # Conservar el handle antes de que termine un proceso de vida corta.
-        $handle = $p.Handle
-        if (-not $p.WaitForExit(20000)) {
-          Stop-Process -Id $p.Id -Force
-          throw 'Packaged diagnosis timed out'
-        }
-        $p.Refresh()
-        $exitCode = $p.ExitCode
-        Write-Host "Packaged diagnosis exit code: [$exitCode]"
-        foreach ($file in @($stdout, $stderr)) {
-          Write-Host "Diagnostic file: $file"
-          if (Test-Path $file) { Get-Content -Path $file }
-        }
-        if ($null -eq $exitCode) { throw 'PowerShell could not obtain the packaged process exit code' }
-        if ($exitCode -ne 0) { throw "Packaged dispatch failed with exit code $exitCode; see diagnostic output and artifact" }
-        # Exigir un informe válido: salir con 0 sin ejecutar el diagnóstico no basta.
-        $report = $null
-        if (Test-Path $stdout) {
-          foreach ($line in Get-Content -Path $stdout) {
-            try {
-              $candidate = $line | ConvertFrom-Json -ErrorAction Stop
-              if ($candidate.type -eq 'DIAGNOSTICS') { $report = $candidate }
-            } catch { }
+        $cases = @(
+          @{ Name = 'windowed-default'; Exe = 'DashEyes.exe'; NativeFirst = $false },
+          @{ Name = 'console-default'; Exe = 'DashEyes-Diagnostic.exe'; NativeFirst = $false },
+          @{ Name = 'windowed-native-first'; Exe = 'DashEyes.exe'; NativeFirst = $true },
+          @{ Name = 'console-native-first'; Exe = 'DashEyes-Diagnostic.exe'; NativeFirst = $true }
+        )
+        $results = @()
+        foreach ($case in $cases) {
+          $stdout = Join-Path $env:RUNNER_TEMP "dasheyes-diagnose-$($case.Name)-stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "dasheyes-diagnose-$($case.Name)-stderr.log"
+          $arguments = @('--diagnose', '--no-camera')
+          if ($case.NativeFirst) { $arguments += '--native-first' }
+          $exitCode = $null
+          $report = $null
+          $problem = ''
+          try {
+            $path = Join-Path '.\dist\DashEyes' $case.Exe
+            $p = Start-Process -FilePath $path -ArgumentList $arguments -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            $handle = $p.Handle
+            if (-not $p.WaitForExit(20000)) {
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+              $p.WaitForExit(5000) | Out-Null
+              $problem = 'timeout'
+            } else {
+              $p.Refresh()
+              $exitCode = $p.ExitCode
+            }
+          } catch {
+            $problem = $_.Exception.Message
           }
+          Write-Host "Case: $($case.Name), exit code: [$exitCode], problem: $problem"
+          foreach ($file in @($stdout, $stderr)) {
+            if (Test-Path $file) { Get-Content -Path $file }
+          }
+          if (Test-Path $stdout) {
+            foreach ($line in Get-Content -Path $stdout) {
+              try {
+                $candidate = $line | ConvertFrom-Json -ErrorAction Stop
+                if ($candidate.type -eq 'DIAGNOSTICS') { $report = $candidate }
+              } catch { }
+            }
+          }
+          $ok = $null -ne $exitCode -and $exitCode -eq 0 -and $null -ne $report -and $report.packages_ok -eq $true
+          $results += [pscustomobject]@{ case = $case.Name; passed = $ok; exit_code = $exitCode; problem = $problem }
         }
-        if ($null -eq $report) { throw 'The executable returned no DIAGNOSTICS report' }
-        if ($report.packages_ok -ne $true) { throw 'Packaged dependencies failed validation; see packages_details' }
+        $results | Format-Table -AutoSize
+        $results | ConvertTo-Json | Set-Content (Join-Path $env:RUNNER_TEMP 'dasheyes-comparison.json')
+        # Las comparaciones no sustituyen ni relajan la validación de la app real.
+        if (-not $results[0].passed) { throw 'Production executable still fails; see four-case comparison and diagnostic artifact' }
+        if (@($results | Where-Object { -not $_.passed }).Count -gt 0) {
+          throw 'At least one controlled native-import comparison failed; inspect the comparison artifact'
+        }
 
     - name: Preserve diagnostics even when packaging validation fails
       if: always()
@@ -94,6 +118,7 @@ jobs:
         path: |
           ${{ runner.temp }}/dasheyes-diagnose-*.log
           ${{ runner.temp }}/dasheyes-native-libraries.log
+          ${{ runner.temp }}/dasheyes-comparison.json
           build/**/warn-*.txt
           dist/DashEyes/.dasheyes/logs/*.log
           dist/DashEyes/_internal/.dasheyes/logs/*.log
@@ -102,5 +127,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: DashEyes-Windows-x64
-        path: dist/DashEyes/
+        path: |
+          dist/DashEyes/
+          !dist/DashEyes/DashEyes-Diagnostic.exe
         retention-days: 14

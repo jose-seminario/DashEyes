@@ -33,9 +33,12 @@ def parse_arguments(argv=None):
     parser.add_argument("--dashboard", action="store_true", help="Recibir JSON por stdin")
     parser.add_argument("--diagnose", action="store_true", help="Comprobar dependencias y salir")
     parser.add_argument("--no-camera", action="store_true", help="Diagnóstico sin abrir cámara virtual")
+    parser.add_argument("--native-first", action="store_true", help="Comparar importación de MediaPipe antes de OpenCV")
     args = parser.parse_args(argv)
     if args.no_camera and not args.diagnose:
         parser.error("--no-camera requiere --diagnose")
+    if args.native_first and not args.diagnose:
+        parser.error("--native-first requiere --diagnose")
     return args
 
 
@@ -241,7 +244,7 @@ def main(argv=None):
     args = parse_arguments(argv)
     if args.diagnose:
         from diagnostics import diagnose
-        result = diagnose(check_camera=not args.no_camera)
+        result = diagnose(check_camera=not args.no_camera, native_first=args.native_first)
         emit(result)
         return 0 if result["packages_ok"] else 1
     try:

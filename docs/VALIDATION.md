@@ -32,6 +32,14 @@ salida JSON y el artefacto `DashEyes-build-diagnostics`, que incluye el inventar
 de DLL/PYD y las advertencias de PyInstaller. Un error de `_framework_bindings`
 durante importación no demuestra ausencia de webcam ni de OBS.
 
+Para investigar el fallo persistente del paquete, CI prepara cuatro casos
+controlados (windowed/console y OpenCV-primero/MediaPipe-primero), usando el mismo
+paquete de dependencias. `dasheyes-comparison.json` resume los resultados. Los
+informes incluyen tracebacks y estado de los descriptores estándar para comprobar
+la hipótesis del bootloader windowed. No se considera arreglado el error hasta
+que pase el ejecutable de producción. No hay que ejecutar estas variantes en el
+equipo universitario: son comprobaciones remotas de CI.
+
 ## Comprobaciones manuales en Windows
 
 ### 1. Lectura

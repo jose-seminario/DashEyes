@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Un único punto de entrada. No ejecutar módulos de soporte como scripts.
+import os
 from PyInstaller.utils.hooks import (
     collect_data_files, collect_dynamic_libs, collect_delvewheel_libs_directory,
 )
@@ -37,4 +38,12 @@ exe = EXE(
     debug=False, strip=False, upx=False, console=False,
     disable_windowed_traceback=False,
 )
-coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='DashEyes')
+executables = [exe]
+if os.environ.get('DASHEYES_BUILD_CONSOLE_PROBE') == '1':
+    # Comparación controlada en CI: exactamente el mismo código y dependencias,
+    # cambiando solo el bootloader windowed por el bootloader console.
+    executables.append(EXE(
+        pyz, a.scripts, [], exclude_binaries=True, name='DashEyes-Diagnostic',
+        debug=False, strip=False, upx=False, console=True,
+    ))
+coll = COLLECT(*(executables + [a.binaries, a.datas]), strip=False, upx=False, name='DashEyes')

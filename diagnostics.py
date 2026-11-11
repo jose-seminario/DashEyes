@@ -1,14 +1,40 @@
 """Diagnóstico aislado: nunca instala paquetes ni solicita privilegios."""
 
 import importlib
+import os
+import sys
+import traceback
 
 
-def diagnose(check_camera=True):
+def runtime_context():
+    context = {"frozen": bool(getattr(sys, "frozen", False)), "python": sys.version,
+               "crt_fds": {}, "python_fds": {}}
+    for descriptor in (0, 1, 2):
+        try:
+            os.fstat(descriptor)
+            context["crt_fds"][str(descriptor)] = "valid"
+        except OSError as exc:
+            context["crt_fds"][str(descriptor)] = str(exc)
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(sys, name)
+        try:
+            context["python_fds"][name] = stream.fileno() if stream is not None else None
+        except (OSError, ValueError):
+            context["python_fds"][name] = "not a native stream"
+    return context
+
+
+def diagnose(check_camera=True, native_first=False):
     result = {"type": "DIAGNOSTICS", "packages_ok": True, "packages_details": [],
-              "obs_driver_ok": False, "obs_details": "No comprobado"}
+              "obs_driver_ok": False, "obs_details": "No comprobado",
+              "runtime": runtime_context(), "import_errors": {}}
     # Reproducir el orden del proceso de vídeo. Qt pertenece a la UI y no debe
     # precargar sus DLL antes de comprobar los bindings nativos de MediaPipe.
-    for name in ("numpy", "cv2", "mediapipe", "pyvirtualcam", "PyQt6.QtWidgets"):
+    order = ("numpy", "cv2", "mediapipe", "pyvirtualcam", "PyQt6.QtWidgets")
+    if native_first:
+        order = ("mediapipe", "numpy", "cv2", "pyvirtualcam", "PyQt6.QtWidgets")
+    result["import_order"] = list(order)
+    for name in order:
         try:
             module = importlib.import_module(name)
             if name == "mediapipe" and not hasattr(getattr(getattr(module, "solutions", None), "face_mesh", None), "FaceMesh"):
@@ -17,6 +43,7 @@ def diagnose(check_camera=True):
         except Exception as exc:
             result["packages_ok"] = False
             result["packages_details"].append([name, False, str(exc)])
+            result["import_errors"][name] = traceback.format_exc()
     if not check_camera:
         result["obs_details"] = "Comprobación de cámara omitida explícitamente"
     elif result["packages_ok"]:

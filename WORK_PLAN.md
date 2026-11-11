@@ -68,6 +68,19 @@ También conserva el inventario de DLL/PYD. Se añadieron cuatro pruebas de
 regresión (37 en total). Esta corrección sigue pendiente de validación remota;
 no se ha identificado la DLL concreta que falló ni se declara resuelto sin CI.
 
+El usuario comunicó que `2ce0270` sigue fallando al inicializar el mismo binding.
+La recolección adicional y el cambio de orden respecto a Qt no solucionaron el
+problema. No deben presentarse como una corrección confirmada.
+
+Se preparó una comparación controlada, pendiente de push autorizado, con el mismo
+código y dependencias: windowed/console y OpenCV-primero/MediaPipe-primero. Se
+conservan los cuatro resultados aunque falle el primero, los tracebacks y el
+estado de los descriptores estándar de Python/CRT. Esto permite separar problemas
+del bootloader sin consola de conflictos de importación, sin afirmar de antemano
+cuál es la causa. El exe de consola se construye únicamente si CI lo solicita y
+se excluye del artefacto de distribución. La app de producción sigue debiendo
+superar su prueba; las variantes no sustituyen esa validación.
+
 - No se promete mirada perfecta, invisibilidad universal ni FPS sin mediciones.
 - El efecto queda sin aplicar hasta calibrar. La referencia no se reutiliza entre
   sesiones o tras una pérdida de cámara, para evitar aplicar una calibración ajena.

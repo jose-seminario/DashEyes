@@ -42,7 +42,13 @@ class DiagnosticsTests(unittest.TestCase):
     def test_cli_explicitly_disables_camera_check(self):
         with patch("diagnostics.diagnose", return_value={"packages_ok": True}) as diagnose, patch.object(main, "emit"):
             self.assertEqual(main.main(["--diagnose", "--no-camera"]), 0)
-        diagnose.assert_called_once_with(check_camera=False)
+        diagnose.assert_called_once_with(check_camera=False, native_first=False)
+
+    def test_comparison_imports_mediapipe_first_when_requested(self):
+        with patch("diagnostics.importlib.import_module", side_effect=self._module) as imports:
+            report = diagnostics.diagnose(check_camera=False, native_first=True)
+        self.assertEqual(imports.call_args_list[0].args[0], "mediapipe")
+        self.assertTrue(report["packages_ok"])
 
 
 if __name__ == "__main__":
