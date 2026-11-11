@@ -3,10 +3,19 @@
 import multiprocessing as mp
 import sys
 
+
+def should_dispatch_to_orchestrator(argv=None):
+    args = sys.argv[1:] if argv is None else list(argv)
+    return any(
+        arg in ("--mode", "--diagnose", "-h", "--help") or arg.startswith("--mode=")
+        for arg in args
+    )
+
+
 if __name__ == "__main__":
     mp.freeze_support()
     # Despachar antes de importar Qt para no cargar la UI en los otros modos.
-    if "--mode" in sys.argv or "--diagnose" in sys.argv:
+    if should_dispatch_to_orchestrator(sys.argv[1:]):
         import main as orchestrator
         sys.exit(orchestrator.main())
 
@@ -49,10 +58,14 @@ class DashEyesDashboard(QMainWindow):
         self.logger = get_logger("dashboard")
         self.selected_script_path = None
         self.can_use_eye_contact = False
+        self._level1_enabled = True
         self._exiting = False
+        self._force_discard_exit = False
         self._stopping = False
         self._pending_mode = None
         self._session_error = ""
+        self._diagnostic_aborted = False
+        self._diagnostic_abort_reason = ""
         self._session_buffer = bytearray()
         self._diagnostic_buffer = bytearray()
         self.writer = SettingsWriter(self)
@@ -194,6 +207,7 @@ class DashEyesDashboard(QMainWindow):
 
     def _load_controls(self):
         config = config_manager.load_config()
+        self._level1_enabled = config_manager.level1_controls_enabled(config)
         controls = (self.intensity_slider, self.toggle_checkbox, self.camera_index, self.profile)
         for control in controls:
             control.blockSignals(True)
@@ -203,6 +217,9 @@ class DashEyesDashboard(QMainWindow):
         self.profile.setCurrentIndex(self.profile.findData(config["video"]["profile"]))
         for control in controls:
             control.blockSignals(False)
+        self.intensity_label.setVisible(self._level1_enabled)
+        self.intensity_slider.setVisible(self._level1_enabled)
+        self.intensity_slider.setEnabled(self._level1_enabled)
         self.intensity_label.setText(f"Intensidad máxima: {self.intensity_slider.value()}%")
 
     def _controls_changed(self, *_):
@@ -215,9 +232,12 @@ class DashEyesDashboard(QMainWindow):
     def _settings_saved(self, success, message):
         self.settings_label.setText(message)
         self.settings_label.setStyleSheet("color: #94A3B8" if success else "color: #FBBF24")
-        if not success and self._pending_mode is not None:
-            self._pending_mode = None
-            self.status_label.setText("No se inició la sesión porque quedan ajustes sin guardar.")
+        if not success:
+            if self._pending_mode is not None:
+                self._pending_mode = None
+                self.status_label.setText("No se inició la sesión porque quedan ajustes sin guardar.")
+            if not self._exiting:
+                self.writer.discard_unsaved()
             self._refresh_controls()
 
     def _start_pending(self):
@@ -240,6 +260,7 @@ class DashEyesDashboard(QMainWindow):
         self.launch_teleprompter_btn.setEnabled(not busy and not self._exiting)
         self.launch_eye_contact_btn.setEnabled(self.can_use_eye_contact and not busy and not diagnosing and not self._exiting)
         self.calibration_frame.setEnabled(not busy and not self._exiting)
+        self.intensity_slider.setEnabled(self._level1_enabled and not busy and not self._exiting)
         self.repair_btn.setEnabled(not busy and not diagnosing and not self._exiting)
         self.stop_btn.setEnabled(running and not self._stopping)
 
@@ -247,7 +268,10 @@ class DashEyesDashboard(QMainWindow):
         if self._exiting or self._running() or self.diagnostic.state() != QProcess.ProcessState.NotRunning:
             return
         self._diagnostic_buffer.clear()
+        self._diagnostic_aborted = False
+        self._diagnostic_abort_reason = ""
         self.can_use_eye_contact = False
+        self.diagnostics_details.clear()
         self.diagnostics_label.setText("Comprobando API y cámara virtual en un proceso aislado…")
         program, arguments = self._command(["--diagnose"])
         self.diagnostic.start(program, arguments)
@@ -255,13 +279,25 @@ class DashEyesDashboard(QMainWindow):
         self._refresh_controls()
 
     def _read_diagnostics(self):
+        if self._diagnostic_aborted:
+            self.diagnostic.readAllStandardOutput()
+            return
         self._diagnostic_buffer.extend(bytes(self.diagnostic.readAllStandardOutput()))
         if len(self._diagnostic_buffer) > 128_000:
-            self._diagnostic_timed_out()
+            self._diagnostic_buffer.clear()
+            self._diagnostic_timed_out("Diagnóstico detenido por exceso de salida.")
 
-    def _diagnostic_finished(self, *_):
+    def _diagnostic_finished(self, exit_code=0, exit_status=QProcess.ExitStatus.NormalExit):
         self.diagnostic_timeout.stop()
+        if self._diagnostic_aborted:
+            self.can_use_eye_contact = False
+            self.diagnostics_label.setText(self._diagnostic_abort_reason or "Diagnóstico detenido por tiempo límite.")
+            self._refresh_controls()
+            return
         self._read_diagnostics()
+        if self._diagnostic_aborted:
+            self._refresh_controls()
+            return
         result = None
         for line in self._diagnostic_buffer.splitlines():
             try:
@@ -270,26 +306,49 @@ class DashEyesDashboard(QMainWindow):
                     result = candidate
             except (ValueError, UnicodeError):
                 continue
-        if result:
-            self.can_use_eye_contact = result["packages_ok"] and result["obs_driver_ok"]
+        normal_exit = exit_status == QProcess.ExitStatus.NormalExit and exit_code == 0
+        if result and normal_exit:
+            self.can_use_eye_contact = bool(
+                result.get("packages_ok")
+                and result.get("face_mesh_ok", True)
+                and result.get("obs_driver_ok")
+            )
             self.diagnostics_label.setText("Entorno Eye Contact disponible" if self.can_use_eye_contact else "Eye Contact no disponible; el modo lectura sigue disponible")
-            failures = [f"{name}: {detail}" for name, ok, detail in result["packages_details"] if not ok]
-            self.diagnostics_details.setText("\n".join([*failures, result["obs_details"]]))
+            failures = [f"{name}: {detail}" for name, ok, detail in result.get("packages_details", []) if not ok]
+            self.diagnostics_details.setText("\n".join([*failures, result.get("obs_details", "")]))
+        elif result:
+            self.can_use_eye_contact = False
+            self.diagnostics_label.setText("Eye Contact no disponible; el modo lectura sigue disponible")
+            failures = [f"{name}: {detail}" for name, ok, detail in result.get("packages_details", []) if not ok]
+            self.diagnostics_details.setText("\n".join([*failures, result.get("obs_details", "")]))
         else:
             self.can_use_eye_contact = False
             self.diagnostics_label.setText("El diagnóstico no respondió. El modo lectura sigue disponible.")
+            self.diagnostics_details.clear()
         self._refresh_controls()
 
     def _diagnostic_failed(self, *_):
         self.diagnostic_timeout.stop()
+        if self._diagnostic_aborted:
+            return
+        self._diagnostic_aborted = True
+        self._diagnostic_abort_reason = "No se pudo completar el diagnóstico."
         self.can_use_eye_contact = False
-        self.diagnostics_label.setText("No se pudo completar el diagnóstico.")
+        self.diagnostics_label.setText(self._diagnostic_abort_reason)
+        self.diagnostics_details.clear()
         self._refresh_controls()
 
-    def _diagnostic_timed_out(self):
+    def _diagnostic_timed_out(self, reason="Diagnóstico detenido por tiempo límite."):
+        if self._diagnostic_aborted:
+            return
+        self._diagnostic_aborted = True
+        self._diagnostic_abort_reason = reason
+        self._diagnostic_buffer.clear()
         self.diagnostic.kill()
         self.can_use_eye_contact = False
-        self.diagnostics_label.setText("Diagnóstico detenido por tiempo límite.")
+        self.diagnostics_label.setText(reason)
+        self.diagnostics_details.clear()
+        self._refresh_controls()
 
     def on_select_script_clicked(self):
         path, _ = QFileDialog.getOpenFileName(self, "Seleccionar guion", "", "Texto (*.txt *.md)")
@@ -335,6 +394,9 @@ class DashEyesDashboard(QMainWindow):
                 continue
             if message.get("type") == "ERROR":
                 self._session_error = str(message.get("message", "Error de sesión"))
+            elif message.get("type") == "WARNING" and message.get("message"):
+                self.settings_label.setText(str(message["message"]))
+                self.settings_label.setStyleSheet("color: #FBBF24")
             if message.get("message"):
                 suffix = f" | {message['fps']} FPS | {message.get('processing_ms', 0)} ms" if "fps" in message else ""
                 self.status_label.setText(str(message["message"]) + suffix)
@@ -350,6 +412,9 @@ class DashEyesDashboard(QMainWindow):
             self._session_error = "No se pudo iniciar la sesión: " + self.session.errorString()
             self.status_label.setText(self._session_error)
             self._refresh_controls()
+            if not self._exiting:
+                self.showNormal()
+                QMessageBox.warning(self, "Sesión detenida", self._session_error)
 
     def _session_finished(self, code, *_):
         self._read_session()
@@ -357,6 +422,9 @@ class DashEyesDashboard(QMainWindow):
         self._load_controls()
         self._stopping = False
         self._refresh_controls()
+        if not self._exiting and not self.isVisible():
+            self.showNormal()
+            self.activateWindow()
         if self._session_error or code:
             message = self._session_error or "La sesión terminó con error. Revisa .dasheyes/logs."
             self.status_label.setText(message)
@@ -396,6 +464,33 @@ class DashEyesDashboard(QMainWindow):
     def _finish_exit(self):
         if self._exiting and not self._running() and self.diagnostic.state() == QProcess.ProcessState.NotRunning and not self.writer.isRunning():
             self.exit_monitor.stop()
+            if self.writer.has_unsaved_changes() and not self._force_discard_exit:
+                if not self.writer.flush_sync() and self.isVisible():
+                    box = QMessageBox(self)
+                    box.setIcon(QMessageBox.Icon.Warning)
+                    box.setWindowTitle("Ajustes sin guardar")
+                    box.setText(f"No se pudieron guardar los ajustes antes de salir.\n{self.writer.last_error}")
+                    retry_btn = box.addButton("Reintentar", QMessageBox.ButtonRole.AcceptRole)
+                    discard_btn = box.addButton("Salir sin guardar", QMessageBox.ButtonRole.DestructiveRole)
+                    cancel_btn = box.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+                    box.exec()
+                    clicked = box.clickedButton()
+                    if clicked == retry_btn and self.writer.flush_sync():
+                        pass
+                    elif clicked == cancel_btn or (clicked == retry_btn and self.writer.has_unsaved_changes()):
+                        self._exiting = False
+                        self.writer = SettingsWriter(self)
+                        self.writer.saved.connect(self._settings_saved)
+                        self.writer.idle.connect(self._start_pending)
+                        self.writer.start()
+                        self._refresh_controls()
+                        return
+                    elif clicked == discard_btn:
+                        self._force_discard_exit = True
+                        self.writer.discard_unsaved()
+                else:
+                    self._force_discard_exit = True
+                    self.writer.discard_unsaved()
             self.close()
 
     def closeEvent(self, event):
