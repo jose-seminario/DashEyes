@@ -44,6 +44,18 @@
 
 ## Decisiones deliberadas
 
+### Incidencia de CI pendiente de diagnóstico
+
+La primera ejecución comunicada por el usuario llegó al smoke test del ejecutable
+y falló con el mensaje genérico `Packaged dispatch failed`. Ese mensaje no permite
+distinguir un error de dependencias empaquetadas, arranque o lectura del ExitCode
+por PowerShell. No se da por corregida la causa raíz.
+
+Se preparó captura de stdout/stderr, conservación del handle del proceso,
+comprobación explícita del ExitCode y del informe JSON y publicación de los logs
+incluso si el paso falla. Este ajuste requiere un nuevo commit/push autorizado;
+no se han ejecutado pruebas en el equipo universitario.
+
 - No se promete mirada perfecta, invisibilidad universal ni FPS sin mediciones.
 - El efecto queda sin aplicar hasta calibrar. La referencia no se reutiliza entre
   sesiones o tras una pérdida de cámara, para evitar aplicar una calibración ajena.

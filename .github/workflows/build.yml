@@ -41,12 +41,49 @@ jobs:
 
     - name: Packaged dispatch smoke test (no webcam)
       run: |
-        $p = Start-Process -FilePath '.\dist\DashEyes\DashEyes.exe' -ArgumentList '--diagnose' -PassThru
+        $stdout = Join-Path $env:RUNNER_TEMP 'dasheyes-diagnose-stdout.log'
+        $stderr = Join-Path $env:RUNNER_TEMP 'dasheyes-diagnose-stderr.log'
+        $p = Start-Process -FilePath '.\dist\DashEyes\DashEyes.exe' -ArgumentList '--diagnose' -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        # Conservar el handle antes de que termine un proceso de vida corta.
+        $handle = $p.Handle
         if (-not $p.WaitForExit(20000)) {
           Stop-Process -Id $p.Id -Force
           throw 'Packaged diagnosis timed out'
         }
-        if ($p.ExitCode -ne 0) { throw 'Packaged dispatch failed' }
+        $p.Refresh()
+        $exitCode = $p.ExitCode
+        Write-Host "Packaged diagnosis exit code: [$exitCode]"
+        foreach ($file in @($stdout, $stderr)) {
+          Write-Host "Diagnostic file: $file"
+          if (Test-Path $file) { Get-Content -Path $file }
+        }
+        if ($null -eq $exitCode) { throw 'PowerShell could not obtain the packaged process exit code' }
+        if ($exitCode -ne 0) { throw "Packaged dispatch failed with exit code $exitCode; see diagnostic output and artifact" }
+        # Exigir un informe válido: salir con 0 sin ejecutar el diagnóstico no basta.
+        $report = $null
+        if (Test-Path $stdout) {
+          foreach ($line in Get-Content -Path $stdout) {
+            try {
+              $candidate = $line | ConvertFrom-Json -ErrorAction Stop
+              if ($candidate.type -eq 'DIAGNOSTICS') { $report = $candidate }
+            } catch { }
+          }
+        }
+        if ($null -eq $report) { throw 'The executable returned no DIAGNOSTICS report' }
+        if ($report.packages_ok -ne $true) { throw 'Packaged dependencies failed validation; see packages_details' }
+
+    - name: Preserve diagnostics even when packaging validation fails
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: DashEyes-build-diagnostics
+        if-no-files-found: warn
+        include-hidden-files: true
+        path: |
+          ${{ runner.temp }}/dasheyes-diagnose-*.log
+          build/**/warn-*.txt
+          dist/DashEyes/.dasheyes/logs/*.log
+          dist/DashEyes/_internal/.dasheyes/logs/*.log
 
     - name: Upload Windows Executable Artifact
       uses: actions/upload-artifact@v4
