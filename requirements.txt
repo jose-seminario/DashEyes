@@ -1,5 +1,6 @@
-PyQt6>=6.5.0
-opencv-contrib-python>=4.8.0
-mediapipe>=0.10.0
-pyvirtualcam>=0.10.0
-numpy>=1.24.0
+# Versiones directas fijadas para la API FaceMesh. Pendientes de validar en Windows.
+PyQt6==6.7.1
+opencv-contrib-python==4.11.0.86
+mediapipe==0.10.21
+pyvirtualcam==0.12.1
+numpy==1.26.4

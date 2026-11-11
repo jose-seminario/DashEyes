@@ -1,173 +1,251 @@
-"""
-main.py - Orquestador Multiprocesos de DashEyes (V2.0 Dual Mode / Nivel 1)
-freeze_support() en primera línea, arranque condicional por --mode (teleprompter/eye_contact),
-conexión directa de tuberías UI -> Video y cierre explícito en finally.
+"""Orquestador sin dependencias gráficas ni de vídeo al importar.
+
+Cada cola tiene una función explícita. El padre es el único emisor hacia vídeo;
+el Event de parada no depende de que una cola esté vacía o tenga espacio.
 """
 
-import sys
 import multiprocessing as mp
 
-# CRÍTICO: freeze_support() en primera línea para PyInstaller en Windows
 if __name__ == "__main__":
     mp.freeze_support()
 
-import time
 import argparse
+import json
+import queue
+import signal
+import sys
+import threading
+import time
+
 import config_manager
-from teleprompter_ui import run_teleprompter_process
-from video_worker import run_video_worker
+from protocol import drain, offer, valid_command
+from runtime import ProcessJob, get_logger, restore_redirected_stdio
 
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="DashEyes Orchestrator")
-    parser.add_argument("--script", default=None, help="Ruta hacia el archivo de guión (.txt o .md)")
-    parser.add_argument(
-        "--mode",
-        default="teleprompter",
-        choices=["teleprompter", "eye_contact"],
-        help="Modo de ejecución: teleprompter (liviano/sin admin) o eye_contact (cámara virtual)"
-    )
-    parser.add_argument("--intensity", type=int, default=None, help="Intensidad de corrección de mirada (0-100)")
-    parser.add_argument("--eye-contact-enabled", type=int, default=None, help="Estado inicial de activación (1 o 0)")
-    args, _ = parser.parse_known_args()
-    return args
+def parse_arguments(argv=None):
+    parser = argparse.ArgumentParser(description="DashEyes")
+    parser.add_argument("--mode", choices=["teleprompter", "eye_contact"], default="teleprompter")
+    parser.add_argument("--script")
+    parser.add_argument("--camera", type=int)
+    parser.add_argument("--profile", choices=list(config_manager.PROFILES))
+    parser.add_argument("--intensity", type=int)
+    parser.add_argument("--eye-contact-enabled", type=int, choices=[0, 1])
+    parser.add_argument("--dashboard", action="store_true", help="Recibir JSON por stdin")
+    return parser.parse_args(argv)
 
 
-def main():
-    mp.freeze_support()
-    args = parse_arguments()
-
-    # Si se pasan parámetros de calibración desde el Dashboard, sincronizar en config_manager
-    if args.intensity is not None or args.eye_contact_enabled is not None:
-        enabled_bool = bool(args.eye_contact_enabled) if args.eye_contact_enabled is not None else None
-        config_manager.update_eye_contact_config(intensity=args.intensity, enabled=enabled_bool)
-
-    print("=" * 68)
-    print("      DASHEYES V2.0 - TELEPROMPTER INVISIBLE & MOTOR BLINDADO       ")
-    print(f"      MODO SELECCIONADO: {args.mode.upper()}")
-    print("=" * 68)
-
-    # 1. MODO TELEPROMPTER (Liviano, sin cámara, sin OBS, sin admin)
-    if args.mode == "teleprompter":
-        teleprompter_process = mp.Process(
-            target=run_teleprompter_process,
-            args=(None, args.script),
-            name="DashEyes-Teleprompter"
-        )
-        print(f"[ORQUESTADOR] Iniciando Modo Teleprompter (Guión: {args.script or 'Por defecto'})...")
-        teleprompter_process.start()
-
-        print("\n[ESTADO: ACTIVO] Atajos Globales F8 (Pausa), F9/F10 (Velocidad), F2 (HUD).")
-
+def emit(message):
+    if sys.stdout is not None:
         try:
-            while teleprompter_process.is_alive():
-                time.sleep(0.2)
-        except KeyboardInterrupt:
-            print("\n[ORQUESTADOR] Interrupción por teclado.")
-        finally:
-            if teleprompter_process.is_alive():
-                teleprompter_process.join(timeout=1.0)
-                if teleprompter_process.is_alive():
-                    teleprompter_process.terminate()
-                    teleprompter_process.join(timeout=0.5)
-            print("[ORQUESTADOR] Teleprompter cerrado correctamente.")
-        return
+            print(json.dumps(message, ensure_ascii=True), flush=True)
+        except (OSError, ValueError):
+            pass
 
-    # 2. MODO EYE CONTACT (Completo con video y cámara virtual)
-    # Tuberías directas: cmd_pipe_parent se entrega a teleprompter_process para control en vivo
-    cmd_pipe_parent, cmd_pipe_child = mp.Pipe(duplex=False)
-    ack_pipe_child, ack_pipe_parent = mp.Pipe(duplex=False)
 
-    video_process = mp.Process(
-        target=run_video_worker,
-        args=(cmd_pipe_child, ack_pipe_child, None),
-        name="DashEyes-VideoWorker"
-    )
-
-    teleprompter_process = mp.Process(
-        target=run_teleprompter_process,
-        args=(cmd_pipe_parent, args.script),
-        name="DashEyes-Teleprompter"
-    )
-
-    print("[ORQUESTADOR] Lanzando Motor de Video y Cámara Virtual...")
-    video_process.start()
-
-    cmd_pipe_child.close()
-    ack_pipe_child.close()
-
-    print(f"[ORQUESTADOR] Lanzando Teleprompter Invisible (Guión: {args.script or 'Por defecto'})...")
-    teleprompter_process.start()
-
-    print("\n[ESTADO: ACTIVO] Atajos Globales F8 (Pausa), F9/F10 (Velocidad), F2 (HUD).")
-
+def _run_video(commands, events, previews, stop, settings):
+    logger = get_logger("video")
+    previews.cancel_join_thread()
     try:
-        while True:
-            if not teleprompter_process.is_alive():
-                print("\n[ORQUESTADOR] Teleprompter cerrado.")
-                break
-
-            if not video_process.is_alive():
-                print("\n[ORQUESTADOR] El proceso de video ha terminado.")
-                break
-
-            time.sleep(0.2)
-
-    except KeyboardInterrupt:
-        print("\n[ORQUESTADOR] Interrupción por teclado.")
-
+        try:
+            from video_worker import run_video_worker
+        except Exception:
+            logger.exception("No se pudo importar el motor")
+            offer(events, {"type": "ERROR", "message": "No se pudo cargar el motor. Revisa las dependencias y el registro local."})
+            raise
+        run_video_worker(commands, events, previews, stop, settings)
     finally:
-        print("\n[ORQUESTADOR] Ejecutando Handshake de parada...")
+        # El padre drena esta cola también durante el cierre.
+        events.close()
+        events.join_thread()
 
-        # Implementación Opción (b): Enviar STOP de respaldo y cerrar explícitamente el descriptor
-        try:
-            cmd_pipe_parent.send({"cmd": "STOP"})
-        except Exception:
-            pass
 
-        try:
-            cmd_pipe_parent.close()
-        except Exception:
-            pass
+def _run_ui(commands, events, previews, stop, script, settings, eye_mode):
+    commands.cancel_join_thread()
+    try:
+        from teleprompter_ui import run_teleprompter_process
+        run_teleprompter_process(commands, events, previews, stop, script, settings, eye_mode)
+    except Exception:
+        get_logger("teleprompter").exception("Error de interfaz")
+        offer(commands, {"type": "ERROR", "message": "No se pudo abrir el teleprompter. Revisa las dependencias de interfaz."})
+        stop.set()
+        raise
 
-        ack_confirmed = False
-        start_wait = time.time()
-        timeout_sec = 3.0
 
-        while time.time() - start_wait < timeout_sec:
-            if not video_process.is_alive():
-                ack_confirmed = True
-                break
-
+def _read_dashboard(incoming, stop):
+    if sys.stdin is None:
+        stop.set()
+        return
+    try:
+        for line in sys.stdin:
+            if len(line) > 4096:
+                continue
             try:
-                if ack_pipe_parent.poll(timeout=0.05):
-                    msg = ack_pipe_parent.recv()
-                    if isinstance(msg, dict) and msg.get("cmd") == "ACK_STOP":
-                        ack_confirmed = True
-                        break
-            except Exception:
-                pass
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if valid_command(message):
+                if message["cmd"] == "STOP":
+                    stop.set()
+                else:
+                    offer(incoming, message)
+    finally:
+        stop.set()  # También al desaparecer el Dashboard.
 
-        if ack_confirmed:
-            video_process.join(timeout=1.0)
-        else:
-            if video_process.is_alive():
-                video_process.terminate()
-                video_process.join(timeout=1.0)
 
-        if teleprompter_process.is_alive():
-            teleprompter_process.join(timeout=1.5)
-            if teleprompter_process.is_alive():
-                teleprompter_process.terminate()
-                teleprompter_process.join(timeout=0.5)
+def supervise(args):
+    logger = get_logger("session")
+    context = mp.get_context("spawn")
+    stop = context.Event()
+    incoming = queue.Queue(maxsize=128)
+    ui_commands = context.Queue(maxsize=128)
+    video_commands = context.Queue(maxsize=128)
+    video_events = context.Queue(maxsize=64)
+    ui_events = context.Queue(maxsize=64)
+    previews = context.Queue(maxsize=1)
+    channels = (ui_commands, video_commands, video_events, ui_events, previews)
+    processes = []
+    job = None
+    exit_code = 0
+    settings = config_manager.load_config()
+    # Los argumentos son ajustes de esta sesión, no sobrescriben preferencias.
+    if args.camera is not None:
+        settings["video"]["camera_index"] = args.camera
+    if args.profile is not None:
+        settings["video"]["profile"] = args.profile
+    if args.intensity is not None:
+        settings["eye_contact"]["intensity"] = args.intensity
+    if args.eye_contact_enabled is not None:
+        settings["eye_contact"]["enabled"] = bool(args.eye_contact_enabled)
+    settings = config_manager.normalize_config(settings)
+    eye_mode = args.mode == "eye_contact"
+    ready = not eye_mode
+    ui_ready = False
+    started = time.monotonic()
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda *_: stop.set())
+        job = ProcessJob()
+        if args.dashboard:
+            threading.Thread(target=_read_dashboard, args=(incoming, stop), daemon=True).start()
+        if eye_mode:
+            video = context.Process(
+                target=_run_video, args=(video_commands, video_events, previews, stop, settings),
+                name="DashEyes-Video",
+            )
+            video.start()
+            processes.append(video)
+            job.add(video)
+        ui = context.Process(
+            target=_run_ui,
+            args=(ui_commands, ui_events, previews, stop, args.script, settings, eye_mode),
+            name="DashEyes-Teleprompter",
+        )
+        ui.start()
+        processes.append(ui)
+        job.add(ui)
+        emit({"type": "STARTING", "mode": args.mode})
+        while not stop.wait(0.03):
+            for channel in (incoming, ui_commands):
+                for message in drain(channel):
+                    if isinstance(message, dict) and message.get("type") == "UI_READY":
+                        ui_ready = True
+                        if not eye_mode:
+                            emit({"type": "READY", "message": "Teleprompter listo; lectura pausada."})
+                        continue
+                    if isinstance(message, dict) and message.get("type") == "ERROR":
+                        emit(message)
+                        exit_code = 1
+                        stop.set()
+                        continue
+                    if not valid_command(message):
+                        continue
+                    if message["cmd"] == "STOP":
+                        stop.set()
+                    elif eye_mode and not offer(video_commands, message):
+                        warning = {"type": "WARNING", "message": "Control no enviado; vuelve a intentarlo."}
+                        emit(warning)
+                        offer(ui_events, warning)
+            for message in drain(video_events):
+                emit(message)
+                offer(ui_events, message)
+                if message.get("type") == "READY":
+                    ready = True
+                elif message.get("type") == "ERROR":
+                    exit_code = 1
+                    stop.set()
+            if not ui.is_alive():
+                exit_code = exit_code or int(ui.exitcode not in (0, None))
+                stop.set()
+            if eye_mode and not video.is_alive():
+                if not stop.is_set():
+                    emit({"type": "ERROR", "message": "El motor de vídeo terminó inesperadamente."})
+                    exit_code = 1
+                stop.set()
+            if (not ready or not ui_ready) and time.monotonic() - started > 30:
+                emit({"type": "ERROR", "message": "La cámara o el motor no respondió en 30 segundos."})
+                exit_code = 1
+                stop.set()
+    except Exception as exc:
+        logger.exception("Error de sesión")
+        emit({"type": "ERROR", "message": str(exc)})
+        exit_code = 1
+    finally:
+        stop.set()
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline and any(p.is_alive() for p in processes):
+            for message in drain(video_events):
+                if message.get("type") == "ERROR":
+                    exit_code = 1
+                emit(message)
+            time.sleep(0.03)
+        for process in processes:
+            process.join(timeout=max(0, deadline - time.monotonic()))
+        for process in processes:
+            if process.is_alive():
+                logger.warning("Terminación de respaldo: %s", process.name)
+                exit_code = 1
+                process.terminate()
+                process.join(timeout=1)
+        if job is not None:
+            job.close()
+        for message in drain(ui_commands):
+            if isinstance(message, dict) and message.get("type") == "ERROR":
+                emit(message)
+                exit_code = 1
+        for process in processes:
+            if process.exitcode not in (0, None):
+                if not exit_code:
+                    emit({"type": "ERROR", "message": f"{process.name} terminó con error. Revisa el registro local."})
+                exit_code = 1
+        for message in drain(video_events):
+            if message.get("type") == "ERROR":
+                exit_code = 1
+            emit(message)
+        for channel in channels:
+            channel.cancel_join_thread()
+            channel.close()
+        for process in processes:
+            if not process.is_alive():
+                process.close()
+        emit({"type": "STOPPED", "exit_code": exit_code})
+    return exit_code
 
-        try:
-            ack_pipe_parent.close()
-        except Exception:
-            pass
 
-        print("[ORQUESTADOR] Procesos cerrados correctamente.")
+def main(argv=None):
+    restore_redirected_stdio()
+    if (sys.argv[1:] if argv is None else argv) == ["--diagnose"]:
+        from diagnostics import diagnose
+        result = diagnose()
+        emit(result)
+        return 0 if result["packages_ok"] else 1
+    args = parse_arguments(argv)
+    try:
+        with config_manager.file_lock("session.lock", timeout=0):
+            return supervise(args)
+    except (config_manager.ConfigError, OSError) as exc:
+        emit({"type": "ERROR", "message": f"No se pudo abrir la sesión: {exc}"})
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

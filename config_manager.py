@@ -1,12 +1,19 @@
-"""
-config_manager.py - Gestor de Persistencia y Configuración Atómica de DashEyes
-Soporta lectura/escritura segura con bloqueo de archivos (msvcrt) y reemplazo atómico en Windows.
+"""Configuración portátil, validada y actualizada bajo un único cerrojo.
+
+Leer no crea archivos. Las escrituras se limitan a .dasheyes junto al programa.
+Los config.json anteriores se leen como respaldo, sin borrarlos ni modificarlos.
 """
 
-import os
-import sys
+import copy
 import json
+import math
+import os
+import shutil
+import sys
+import tempfile
+import threading
 import time
+from contextlib import contextmanager
 
 try:
     import msvcrt
@@ -15,164 +22,223 @@ except ImportError:
 
 DEFAULT_CONFIG = {
     "enable_level1_controls": True,
-    "eye_contact": {
-        "enabled": True,
-        "intensity": 50,
-        "vertical_shift_px": 5.0,
-        "horizontal_inward_px": 1.0,
-    },
+    "eye_contact": {"enabled": True, "intensity": 35},
     "teleprompter": {
-        "scroll_speed": 3,
-        "font_size": 24,
-        "opacity": 215,
-    }
+        "scroll_speed": 3, "font_size": 24, "opacity": 215,
+        "width": 560, "height": 340,
+    },
+    "video": {"camera_index": 0, "profile": "balanced"},
 }
+PROFILES = {
+    "light": {"width": 640, "height": 480, "fps": 20, "detection_width": 320},
+    "balanced": {"width": 1280, "height": 720, "fps": 30, "detection_width": 480},
+}
+_LOCAL_LOCKS = {}
+_LOCK_REGISTRY = threading.Lock()
 
 
-def get_base_dir() -> str:
-    """Retorna el directorio base según si corre congelado (PyInstaller) o como script."""
+class ConfigError(RuntimeError):
+    pass
+
+
+def get_base_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def get_config_path() -> str:
-    return os.path.join(get_base_dir(), "config.json")
+def get_data_dir():
+    return os.path.join(get_base_dir(), ".dasheyes")
 
 
-def get_lock_path() -> str:
-    return os.path.join(get_base_dir(), "config.lock")
+def get_config_path():
+    return os.path.join(get_data_dir(), "config.json")
 
 
-def calculate_shifts(intensity: int) -> tuple:
-    """
-    Mapeo proporcional de Intensidad (0% - 100%) a píxeles de corrección:
-    - vertical_shift_px: 0.0 px (0%) -> 5.0 px (50%) -> 10.0 px (100%)
-    - horizontal_inward_px: 0.0 px (0%) -> 1.0 px (50%) -> 2.0 px (100%)
-    """
-    clamped = max(0, min(100, int(intensity)))
-    factor = clamped / 100.0
-    v_shift = round(factor * 10.0, 1)
-    h_shift = round(factor * 2.0, 1)
-    return v_shift, h_shift
+def get_lock_path():
+    return os.path.join(get_data_dir(), "config.lock")
 
 
-def load_config() -> dict:
-    """Carga config.json. Si no existe o es inválido, genera y guarda los valores por defecto."""
-    cfg_path = get_config_path()
-
-    if not os.path.exists(cfg_path):
-        save_config(DEFAULT_CONFIG)
-        return json.loads(json.dumps(DEFAULT_CONFIG))
-
+def bounded_number(value, default, low, high, integer=False):
+    if isinstance(value, bool):
+        return default
     try:
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            merged = json.loads(json.dumps(DEFAULT_CONFIG))
-            if isinstance(data, dict):
-                for k, v in data.items():
-                    if isinstance(v, dict) and k in merged and isinstance(merged[k], dict):
-                        merged[k].update(v)
+        number = float(value)
+        if not math.isfinite(number):
+            return default
+        number = max(low, min(high, number))
+        return int(number) if integer else number
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def normalize_config(data):
+    result = copy.deepcopy(DEFAULT_CONFIG)
+    if not isinstance(data, dict):
+        return result
+    flag = data.get("enable_level1_controls")
+    if isinstance(flag, bool):
+        result["enable_level1_controls"] = flag
+    for section in ("eye_contact", "teleprompter", "video"):
+        supplied = data.get(section)
+        if not isinstance(supplied, dict):
+            continue
+        target = result[section]
+        limits = {
+            "intensity": (0, 100), "scroll_speed": (1, 10),
+            "font_size": (16, 44), "opacity": (80, 255),
+            "width": (420, 1000), "height": (240, 800), "camera_index": (0, 15),
+        }
+        for key, default in target.items():
+            value = supplied.get(key, default)
+            if key in limits:
+                target[key] = bounded_number(value, default, *limits[key], integer=True)
+            elif isinstance(default, bool):
+                target[key] = value if isinstance(value, bool) else default
+            elif key == "profile":
+                target[key] = value if isinstance(value, str) and value in PROFILES else default
+    return result
+
+
+def calculate_shifts(intensity):
+    """Compatibilidad para integraciones anteriores; el motor usa escala ocular."""
+    factor = bounded_number(intensity, 35, 0, 100) / 100.0
+    return round(factor * 10, 1), round(factor * 2, 1)
+
+
+@contextmanager
+def file_lock(name="config.lock", timeout=0.6):
+    """Nunca continúa sin bloqueo. No trunca un archivo de cerrojo existente."""
+    os.makedirs(get_data_dir(), exist_ok=True)
+    with _LOCK_REGISTRY:
+        local_lock = _LOCAL_LOCKS.setdefault(name, threading.RLock())
+    with local_lock:
+        handle = open(os.path.join(get_data_dir(), name), "a+b")
+        acquired = False
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                try:
+                    handle.seek(0)
+                    if msvcrt is not None:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                     else:
-                        merged[k] = v
-            return merged
-    except Exception:
-        return json.loads(json.dumps(DEFAULT_CONFIG))
-
-
-def save_config(config_data: dict) -> bool:
-    """
-    Escritura atómica de config.json en Windows usando archivo temporal y os.replace(),
-    protegida con bloqueo no bloqueante mediante msvcrt.locking en config.lock.
-    """
-    cfg_path = get_config_path()
-    tmp_path = cfg_path + ".tmp"
-    lock_path = get_lock_path()
-
-    lock_fd = None
-    acquired = False
-
-    if msvcrt is not None:
-        for _ in range(4):
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError as exc:
+                    if time.monotonic() >= deadline:
+                        raise ConfigError("Otro proceso está usando los ajustes o la sesión.") from exc
+                    time.sleep(0.02)
+            yield
+        finally:
             try:
-                lock_fd = open(lock_path, "r+b" if os.path.exists(lock_path) else "w+b")
-                if os.path.getsize(lock_path) == 0:
-                    lock_fd.write(b"L")
-                    lock_fd.flush()
-                lock_fd.seek(0)
-                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
-                acquired = True
-                break
-            except (OSError, IOError):
-                if lock_fd:
-                    try:
-                        lock_fd.close()
-                    except Exception:
-                        pass
-                    lock_fd = None
-                time.sleep(0.025)
+                if acquired:
+                    handle.seek(0)
+                    if msvcrt is not None:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
 
+
+def _read_unlocked(strict=False):
+    path = get_config_path()
+    if not os.path.exists(path):
+        path = os.path.join(get_base_dir(), "config.json")
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(config_data, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-
-        os.replace(tmp_path, cfg_path)
-        return True
-
-    except Exception:
-        if os.path.exists(tmp_path):
+        with open(path, encoding="utf-8-sig") as handle:
+            text = handle.read(65_537)
+            if len(text) > 65_536:
+                raise ValueError("Configuración demasiado grande")
+            return normalize_config(json.loads(text))
+    except FileNotFoundError:
+        return copy.deepcopy(DEFAULT_CONFIG)
+    except (ValueError, UnicodeError):
+        if strict and path == get_config_path():
             try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+                backup = os.path.join(get_data_dir(), f"config-corrupt-{time.time_ns()}.json")
+                shutil.copy2(path, backup)
+            except OSError as exc:
+                raise ConfigError("No se pudo preservar la configuración corrupta; no se sobrescribirá.") from exc
+        return copy.deepcopy(DEFAULT_CONFIG)
+    except OSError as exc:
+        if strict:
+            raise ConfigError("No se pudieron leer los ajustes existentes.") from exc
+        return copy.deepcopy(DEFAULT_CONFIG)
+
+
+def load_config():
+    return _read_unlocked()
+
+
+def _write_unlocked(data):
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=get_data_dir(),
+            prefix="config-", suffix=".tmp", delete=False,
+        ) as handle:
+            path = handle.name
+            json.dump(normalize_config(data), handle, indent=2, ensure_ascii=False, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Windows puede mantener abierto brevemente un lector ajeno al cerrojo.
+        for attempt in range(6):
+            try:
+                os.replace(path, get_config_path())
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.02)
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
+def update_config(patch):
+    """Transacción completa: bloquear, leer la última versión, mezclar y guardar."""
+    if not isinstance(patch, dict):
+        raise ConfigError("La actualización debe ser un objeto.")
+    try:
+        with file_lock():
+            data = _read_unlocked(strict=True)
+            for key, value in patch.items():
+                if isinstance(value, dict) and isinstance(data.get(key), dict):
+                    data[key].update(value)
+                else:
+                    data[key] = value
+            data = normalize_config(data)
+            _write_unlocked(data)
+            return data
+    except (OSError, ValueError) as exc:
+        raise ConfigError("No se guardaron los ajustes; comprueba permisos y espacio en disco.") from exc
+
+
+def save_config(config_data):
+    """API de compatibilidad. Preferir update_config para cambios parciales."""
+    try:
+        update_config(config_data)
+        return True
+    except ConfigError:
         return False
 
-    finally:
-        if acquired and lock_fd and msvcrt is not None:
-            try:
-                lock_fd.seek(0)
-                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
-            except Exception:
-                pass
-        if lock_fd:
-            try:
-                lock_fd.close()
-            except Exception:
-                pass
 
-
-def update_eye_contact_config(intensity: int = None, enabled: bool = None) -> dict:
-    """Actualiza y persiste las variables de Eye Contact."""
-    cfg = load_config()
-    eye_cfg = cfg.setdefault("eye_contact", {})
-
+def update_eye_contact_config(intensity=None, enabled=None):
+    patch = {}
     if intensity is not None:
-        clamped_intensity = max(0, min(100, int(intensity)))
-        eye_cfg["intensity"] = clamped_intensity
-        v_shift, h_shift = calculate_shifts(clamped_intensity)
-        eye_cfg["vertical_shift_px"] = v_shift
-        eye_cfg["horizontal_inward_px"] = h_shift
-
+        patch["intensity"] = intensity
     if enabled is not None:
-        eye_cfg["enabled"] = bool(enabled)
-
-    save_config(cfg)
-    return cfg
+        patch["enabled"] = enabled
+    return update_config({"eye_contact": patch})
 
 
-def update_teleprompter_config(scroll_speed: int = None, font_size: int = None, opacity: int = None) -> dict:
-    """Actualiza y persiste las preferencias del Teleprompter."""
-    cfg = load_config()
-    tele_cfg = cfg.setdefault("teleprompter", {})
-
-    if scroll_speed is not None:
-        tele_cfg["scroll_speed"] = max(1, min(10, int(scroll_speed)))
-    if font_size is not None:
-        tele_cfg["font_size"] = max(16, min(44, int(font_size)))
-    if opacity is not None:
-        tele_cfg["opacity"] = max(80, min(255, int(opacity)))
-
-    save_config(cfg)
-    return cfg
+def update_teleprompter_config(scroll_speed=None, font_size=None, opacity=None):
+    patch = {key: value for key, value in {
+        "scroll_speed": scroll_speed, "font_size": font_size, "opacity": opacity,
+    }.items() if value is not None}
+    return update_config({"teleprompter": patch})

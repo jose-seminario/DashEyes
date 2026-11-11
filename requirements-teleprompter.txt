@@ -1,0 +1,2 @@
+# El modo lectura no necesita cámara, OBS, NumPy ni MediaPipe.
+PyQt6==6.7.1

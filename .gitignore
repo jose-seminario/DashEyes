@@ -1,0 +1,6 @@
+.dasheyes/
+__pycache__/
+*.py[cod]
+build/
+dist/
+tests/tmp*/

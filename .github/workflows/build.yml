@@ -1,5 +1,8 @@
 name: Build DashEyes Windows Executable
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [ main, master ]
@@ -13,21 +16,37 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Set up Python 3.10
+    - name: Set up Python 3.11
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        python-version: '3.11'
         cache: 'pip'
+        cache-dependency-path: |
+          requirements.txt
+          requirements-build.txt
 
     - name: Install Dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pyinstaller
+        python -m pip install -r requirements-build.txt
+        python -m pip check
+
+    - name: Unit and UI tests (no camera required)
+      env:
+        QT_QPA_PLATFORM: offscreen
+      run: python -m unittest discover -s tests -v
 
     - name: Build Executable with PyInstaller
       run: |
-        pyinstaller pyinstaller.spec
+        python -m PyInstaller --noconfirm pyinstaller.spec
+
+    - name: Packaged dispatch smoke test (no webcam)
+      run: |
+        $p = Start-Process -FilePath '.\dist\DashEyes\DashEyes.exe' -ArgumentList '--diagnose' -PassThru
+        if (-not $p.WaitForExit(20000)) {
+          Stop-Process -Id $p.Id -Force
+          throw 'Packaged diagnosis timed out'
+        }
+        if ($p.ExitCode -ne 0) { throw 'Packaged dispatch failed' }
 
     - name: Upload Windows Executable Artifact
       uses: actions/upload-artifact@v4
