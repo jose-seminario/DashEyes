@@ -53,6 +53,7 @@ class InvisibleTeleprompter(QMainWindow):
         self._force_discard = False
         self._drag_pos = None
         self._hotkeys = set()
+        self._slider_labels = {}
         self._screen_connected = False
         self._ready_sent = False
         self._save_failed = False
@@ -64,13 +65,14 @@ class InvisibleTeleprompter(QMainWindow):
         self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMinimumSize(420, 240)
+        self.setMaximumSize(1000, 800)
         self.resize(tele["width"], tele["height"])
         self.setAcceptDrops(True)
         self.setStyleSheet("""
-            QLabel { color: #CBD5E1; font-family: 'Segoe UI'; font-size: 11px; }
-            QPushButton { background: #334155; color: white; padding: 4px 8px; border: none; border-radius: 3px; }
-            QPushButton:hover { background: #475569; }
-            QCheckBox { color: #E2E8F0; }
+            QWidget#panel QLabel { color: #CBD5E1; font-family: 'Segoe UI'; font-size: 11px; }
+            QWidget#panel QPushButton { background: #334155; color: white; padding: 4px 8px; border: none; border-radius: 3px; }
+            QWidget#panel QPushButton:hover { background: #475569; }
+            QWidget#panel QCheckBox { color: #E2E8F0; }
         """)
         self._init_ui()
         self.scroll_timer = QTimer(self)
@@ -98,7 +100,7 @@ class InvisibleTeleprompter(QMainWindow):
 
     def _init_ui(self):
         container = QWidget()
-        container.setStyleSheet("QWidget#panel { background: rgba(15, 23, 42, 235); border-radius: 8px; }")
+        self.panel = container
         container.setObjectName("panel")
         root = QVBoxLayout(container)
         root.setContentsMargins(10, 8, 10, 8)
@@ -138,7 +140,12 @@ class InvisibleTeleprompter(QMainWindow):
         self.width_slider = self._slider(hud, "Ancho de lectura", 420, 1000, self.width(), self._width_changed)
         if self.eye_mode:
             eye = self.config["eye_contact"]
+            level1 = config_manager.level1_controls_enabled(self.config)
             self.eye_slider = self._slider(hud, "Intensidad máxima", 0, 100, eye["intensity"], self._intensity_changed)
+            self.eye_slider.setEnabled(level1)
+            self.eye_slider.setVisible(level1)
+            if self.eye_slider in self._slider_labels:
+                self._slider_labels[self.eye_slider][0].setVisible(level1)
             eye_row = QHBoxLayout()
             self.eye_checkbox = QCheckBox("Habilitar corrección")
             self.eye_checkbox.setChecked(eye["enabled"])
@@ -181,13 +188,18 @@ class InvisibleTeleprompter(QMainWindow):
         slider.setValue(value)
         slider.valueChanged.connect(lambda v: text.setText(f"{label}: {v}"))
         slider.valueChanged.connect(callback)
+        self._slider_labels[slider] = (text, label)
         row.addWidget(slider, 1)
         layout.addLayout(row)
         return slider
 
     def _style_editor(self):
+        if hasattr(self, "panel"):
+            self.panel.setStyleSheet(
+                f"QWidget#panel {{ background: rgba(15, 23, 42, {self.opacity}); border-radius: 8px; }}"
+            )
         self.text_editor.setStyleSheet(f"""
-            QTextEdit {{ background: rgba(15,23,42,{self.opacity}); color: #CBD5E1;
+            QTextEdit {{ background: rgba(15, 23, 42, 0); color: #CBD5E1;
             font-family: 'Segoe UI'; font-size: {self.font_size}px;
             border: 1px solid #334155; border-radius: 6px; padding: 12px; }}
         """)
@@ -247,6 +259,7 @@ class InvisibleTeleprompter(QMainWindow):
     def _speed_changed(self, value):
         self.scroll_speed = value
         self._update_speed()
+        self._update_pause()
         self.writer.submit({"teleprompter": {"scroll_speed": value}})
 
     def _change_speed(self, delta):
@@ -451,6 +464,13 @@ class InvisibleTeleprompter(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if hasattr(self, "width_slider") and self.width_slider.value() != self.width():
+            self.width_slider.blockSignals(True)
+            self.width_slider.setValue(self.width())
+            if self.width_slider in self._slider_labels:
+                label_widget, prefix = self._slider_labels[self.width_slider]
+                label_widget.setText(f"{prefix}: {self.width()}")
+            self.width_slider.blockSignals(False)
         if hasattr(self, "geometry_timer") and not self._closing:
             self.geometry_timer.start(400)
 
