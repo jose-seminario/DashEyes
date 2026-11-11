@@ -9,7 +9,7 @@ import numpy as np
 
 import config_manager
 from eye_contact import EyeContactEngine
-from protocol import drain, offer, valid_command
+from protocol import coalesce_commands, drain, offer, offer_latest, valid_command
 from runtime import get_logger
 
 
@@ -103,6 +103,25 @@ def require_face_mesh():
     return solutions.face_mesh.FaceMesh
 
 
+def fit_frame_to_output(captured, output_size):
+    """Ajusta el fotograma al tamaño de salida conservando su proporción."""
+    out_w, out_h = output_size
+    h, w = captured.shape[:2]
+    if (w, h) == (out_w, out_h):
+        return captured.copy()
+    if abs((w / max(1, h)) - (out_w / max(1, out_h))) <= 0.01:
+        return cv2.resize(captured, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    scale = min(out_w / max(1, w), out_h / max(1, h))
+    scaled_w = max(1, min(out_w, int(round(w * scale))))
+    scaled_h = max(1, min(out_h, int(round(h * scale))))
+    resized = cv2.resize(captured, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    y0 = (out_h - scaled_h) // 2
+    x0 = (out_w - scaled_w) // 2
+    canvas[y0:y0 + scaled_h, x0:x0 + scaled_w] = resized
+    return canvas
+
+
 def run_video_worker(commands, events, previews, stop, settings):
     logger = get_logger("video")
     grabber = face_mesh = virtual = None
@@ -123,6 +142,7 @@ def run_video_worker(commands, events, previews, stop, settings):
         last_status = last_preview = 0.0
         want_preview = False
         output_size = None
+        capture_shape = None
         last_output = None
         count = 0
         rate_start = start
@@ -130,7 +150,7 @@ def run_video_worker(commands, events, previews, stop, settings):
         detection_width = profile["detection_width"]
         slow_frames = 0
         while not stop.is_set():
-            for message in drain(commands):
+            for message in coalesce_commands(list(drain(commands))):
                 if not valid_command(message):
                     continue
                 cmd = message["cmd"]
@@ -159,7 +179,8 @@ def run_video_worker(commands, events, previews, stop, settings):
                 if output_size and missing > 0.5:
                     engine.reset_calibration()
                     if now - last_status > 0.5:
-                        offer(events, {"type": "STATUS", "state": "RECONNECTING", "message": "Sin señal; intentando reconectar."})
+                        offer_latest(events, {"type": "STATUS", "state": "RECONNECTING", "message": "Sin señal; intentando reconectar.",
+                                              "intensity": engine.intensity, "enabled": engine.correction_enabled})
                         last_status = now
                     # No simular vídeo vivo repitiendo el rostro antiguo.
                     last_output = np.zeros((output_size[1], output_size[0], 3), dtype=np.uint8)
@@ -170,6 +191,7 @@ def run_video_worker(commands, events, previews, stop, settings):
             last_id = frame_id
             if output_size is None:
                 h, w = captured.shape[:2]
+                capture_shape = (h, w)
                 # Limitar salida a lo pedido y conservar proporción. Tamaños pares para vcam.
                 scale = min(1, profile["width"] / w, profile["height"] / h)
                 output_size = (max(2, int(w * scale) // 2 * 2), max(2, int(h * scale) // 2 * 2))
@@ -181,14 +203,21 @@ def run_video_worker(commands, events, previews, stop, settings):
                     raise RuntimeError("No se pudo abrir OBS Virtual Camera. Comprueba que esté instalada y libre.") from exc
                 offer(events, {"type": "READY", "width": output_size[0], "height": output_size[1],
                                "message": "Cámara lista. Calibra mirando al objetivo."})
-            frame = cv2.resize(captured, output_size, interpolation=cv2.INTER_AREA) if captured.shape[1::-1] != output_size else captured.copy()
+            elif captured.shape[:2] != capture_shape:
+                capture_shape = captured.shape[:2]
+                engine.reset_calibration()
+                offer_latest(events, {"type": "WARNING", "message": "Cambió el formato de la cámara; vuelve a calibrar."})
+            frame = fit_frame_to_output(captured, output_size)
             original = frame.copy() if want_preview and now - last_preview >= 0.2 else None
             processing_start = time.monotonic()
-            scale = min(1, detection_width / frame.shape[1])
-            small = cv2.resize(frame, (int(frame.shape[1] * scale), max(1, int(frame.shape[0] * scale))), interpolation=cv2.INTER_AREA)
             need_tracking = (engine.correction_enabled and engine.intensity > 0) or engine.calibration_deadline is not None
             landmarks = None
             if need_tracking:
+                scale = min(1, detection_width / frame.shape[1])
+                small = (
+                    cv2.resize(frame, (int(frame.shape[1] * scale), max(1, int(frame.shape[0] * scale))), interpolation=cv2.INTER_AREA)
+                    if scale < 1 else frame
+                )
                 rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                 rgb.flags.writeable = False
                 results = face_mesh.process(rgb)
@@ -199,7 +228,7 @@ def run_video_worker(commands, events, previews, stop, settings):
                 slow_frames += 1
                 if slow_frames >= 30 and detection_width > 320:
                     detection_width = 320
-                    offer(events, {"type": "WARNING", "message": "Detección reducida a 320 px para aliviar la CPU."})
+                    offer_latest(events, {"type": "WARNING", "message": "Detección reducida a 320 px para aliviar la CPU."})
                     slow_frames = 0
             else:
                 slow_frames = max(0, slow_frames - 1)
@@ -212,10 +241,10 @@ def run_video_worker(commands, events, previews, stop, settings):
                 fps = count / elapsed
                 count, rate_start = 0, time.monotonic()
             if now - last_status >= 0.3:
-                offer(events, {"type": "STATUS", "state": engine.current_state,
-                               "message": engine.message, "fps": round(fps, 1),
-                               "processing_ms": round(processing_ms, 1), "detection_width": detection_width,
-                               "intensity": engine.intensity, "enabled": engine.correction_enabled})
+                offer_latest(events, {"type": "STATUS", "state": engine.current_state,
+                                      "message": engine.message, "fps": round(fps, 1),
+                                      "processing_ms": round(processing_ms, 1), "detection_width": detection_width,
+                                      "intensity": engine.intensity, "enabled": engine.correction_enabled})
                 last_status = now
             if original is not None:
                 h = 150
@@ -223,7 +252,7 @@ def run_video_worker(commands, events, previews, stop, settings):
                 comparison = np.hstack((cv2.resize(original, (w, h)), cv2.resize(frame, (w, h))))
                 encoded, jpg = cv2.imencode(".jpg", comparison, [cv2.IMWRITE_JPEG_QUALITY, 70])
                 if encoded:
-                    offer(previews, jpg.tobytes())
+                    offer_latest(previews, jpg.tobytes())
                 last_preview = now
     except Exception as exc:
         logger.exception("Motor detenido por error")

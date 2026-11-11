@@ -60,6 +60,8 @@ class EyeContactEngine:
         self.correction_enabled = bool(enabled)
         self.baseline = None
         self.baseline_rotation = None
+        self.baseline_scale = None
+        self.face_lost_since = None
         self.samples = []
         self.calibration_deadline = None
         self.current_state = "UNCALIBRATED"
@@ -83,6 +85,8 @@ class EyeContactEngine:
     def reset_calibration(self):
         self.baseline = None
         self.baseline_rotation = None
+        self.baseline_scale = None
+        self.face_lost_since = None
         self.samples = []
         self.calibration_deadline = None
         self.reset_tracking()
@@ -92,9 +96,21 @@ class EyeContactEngine:
     def bypass(self, frame, state, message):
         self.current_state, self.message = state, message
         self.reset_tracking()
-        if self.calibration_deadline and time.monotonic() > self.calibration_deadline:
-            self.reset_calibration()
-            self.message = "No se obtuvo una referencia estable. Repite la calibración."
+        if self.calibration_deadline is not None:
+            self.samples.clear()
+            if time.monotonic() > self.calibration_deadline:
+                self.reset_calibration()
+                self.message = "No se obtuvo una referencia estable. Repite la calibración."
+        if state == "NO_FACE":
+            now = time.monotonic()
+            if self.face_lost_since is None:
+                self.face_lost_since = now
+            elif self.baseline is not None and now - self.face_lost_since > 3.0:
+                self.reset_calibration()
+                self.current_state = "NO_FACE"
+                self.message = "Rostro ausente demasiado tiempo; vuelve a calibrar."
+        else:
+            self.face_lost_since = None
         return frame
 
     @staticmethod
@@ -141,15 +157,18 @@ class EyeContactEngine:
         eyes = [self.eye_geometry(points, definition) for definition in EYES]
         if any(eye is None for eye in eyes):
             return self.bypass(frame, "BLINK", "Parpadeo u ojo no visible; vídeo original.")
+        self.face_lost_since = None
+        face_scale = float(np.linalg.norm(points[33] - points[263]))
         gaze = np.array([eye["gaze"] for eye in eyes])
         if self.calibration_deadline is not None:
             if time.monotonic() > self.calibration_deadline:
                 return self.bypass(frame, "UNCALIBRATED", "Repite la calibración.")
             if gate < 0.95:
                 self.samples.clear()
+                self.reset_tracking()
                 self.current_state, self.message = "CALIBRATING", "Coloca la cabeza frente a la cámara."
                 return frame
-            self.samples.append((gaze, rotation))
+            self.samples.append((gaze, rotation, face_scale))
             if len(self.samples) >= 25:
                 measurements = np.array([sample[0] for sample in self.samples])
                 rotations = np.array([cv2.RQDecomp3x3(sample[1])[0] for sample in self.samples])
@@ -158,6 +177,7 @@ class EyeContactEngine:
                 else:
                     self.baseline = np.median(measurements, axis=0)
                     self.baseline_rotation = self.samples[len(self.samples) // 2][1]
+                    self.baseline_scale = float(np.median([sample[2] for sample in self.samples]))
                     self.calibration_deadline = None
                     self.samples.clear()
                     self.reset_tracking()
@@ -168,6 +188,10 @@ class EyeContactEngine:
             return frame
         if self.baseline is None:
             return self.bypass(frame, "UNCALIBRATED", "Mira al objetivo y pulsa Calibrar.")
+        if self.baseline_scale is not None and self.baseline_scale > 0:
+            if abs(face_scale - self.baseline_scale) / self.baseline_scale > 0.28:
+                self.reset_calibration()
+                return self.bypass(frame, "UNCALIBRATED", "Posición o sujeto cambió; vuelve a calibrar.")
         errors = self.baseline - gaze
         if np.max(np.abs(errors)) > 0.16 or np.linalg.norm(errors[0] - errors[1]) > 0.08:
             return self.bypass(frame, "UNCERTAIN", "Desviación grande o inconsistente; vídeo original.")
@@ -187,8 +211,7 @@ class EyeContactEngine:
         changed = False
         for index, eye in enumerate(eyes):
             offset = (eye["horizontal"] * self.offsets[index, 0] + eye["vertical"] * self.offsets[index, 1]) * eye["width"]
-            if np.linalg.norm(offset) >= 0.08:
-                self._deform_eye(frame, eye, offset)
+            if np.linalg.norm(offset) >= 0.08 and self._deform_eye(frame, eye, offset):
                 changed = True
         self.current_state = "CORRECTING" if changed else "NATURAL"
         self.message = "Corrección sutil aplicada." if changed else "Mirada cerca del objetivo; sin corrección."
@@ -200,7 +223,7 @@ class EyeContactEngine:
         x1, y1 = np.maximum(np.floor(contour.min(axis=0) - 4), 0).astype(int)
         x2, y2 = np.minimum(np.ceil(contour.max(axis=0) + 5), [width, height]).astype(int)
         if x2 <= x1 or y2 <= y1:
-            return
+            return False
         crop = frame[y1:y2, x1:x2]
         h, w = crop.shape[:2]
         key = (h, w)
@@ -213,16 +236,30 @@ class EyeContactEngine:
         interior = np.zeros((h, w), dtype=np.uint8)
         cv2.fillPoly(interior, [polygon], 1)
         interior = cv2.erode(interior, np.ones((3, 3), dtype=np.uint8))
+        if not np.any(interior):
+            return False
         edge = np.minimum(cv2.distanceTransform(interior, cv2.DIST_L2, 3) / 2, 1)
         iris = eye["iris"] - [x1, y1] + offset * 0.5
         radius = max(2, eye["width"] * 0.20)
         radial = np.exp(-((grid_x - iris[0]) ** 2 + (grid_y - iris[1]) ** 2) / (2 * radius ** 2))
         mask = (edge * radial).astype(np.float32)
+        active = mask > 0.01
+        if not np.any(active) or float(np.linalg.norm(offset) * np.max(mask)) < 0.05:
+            return False
+        map_x = grid_x - offset[0] * mask
+        map_y = grid_y - offset[1] * mask
+        src_x = np.clip(np.rint(map_x).astype(np.int32), 0, w - 1)
+        src_y = np.clip(np.rint(map_y).astype(np.int32), 0, h - 1)
+        outside_src = interior[src_y, src_x] == 0
+        if np.any(outside_src):
+            map_x = np.where(outside_src, grid_x, map_x)
+            map_y = np.where(outside_src, grid_y, map_y)
         shifted = cv2.remap(
-            crop, grid_x - offset[0] * mask, grid_y - offset[1] * mask,
+            crop, map_x, map_y,
             cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101,
         )
         # Escribir solo dentro del ojo; fuera de él se conserva cada byte.
-        active = mask > 0
-        blended = np.rint(shifted * mask[..., None] + crop * (1 - mask[..., None]))
+        feather = edge.astype(np.float32)[..., None]
+        blended = np.rint(shifted * feather + crop * (1 - feather))
         crop[active] = np.clip(blended[active], 0, 255).astype(np.uint8)
+        return True
