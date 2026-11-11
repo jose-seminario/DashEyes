@@ -68,7 +68,6 @@ def load_config() -> dict:
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # Garantizar claves mínimas
             merged = json.loads(json.dumps(DEFAULT_CONFIG))
             if isinstance(data, dict):
                 for k, v in data.items():
@@ -78,7 +77,6 @@ def load_config() -> dict:
                         merged[k] = v
             return merged
     except Exception:
-        # Ante corrupción de lectura, retornar valores por defecto seguros
         return json.loads(json.dumps(DEFAULT_CONFIG))
 
 
@@ -94,11 +92,13 @@ def save_config(config_data: dict) -> bool:
     lock_fd = None
     acquired = False
 
-    # Intento de cerrojo no bloqueante con reintentos
     if msvcrt is not None:
         for _ in range(4):
             try:
-                lock_fd = open(lock_path, "a+b")
+                lock_fd = open(lock_path, "r+b" if os.path.exists(lock_path) else "w+b")
+                if os.path.getsize(lock_path) == 0:
+                    lock_fd.write(b"L")
+                    lock_fd.flush()
                 lock_fd.seek(0)
                 msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
                 acquired = True
@@ -109,16 +109,15 @@ def save_config(config_data: dict) -> bool:
                         lock_fd.close()
                     except Exception:
                         pass
+                    lock_fd = None
                 time.sleep(0.025)
 
     try:
-        # Escritura en archivo temporal
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(config_data, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
 
-        # Reemplazo atómico NTFS
         os.replace(tmp_path, cfg_path)
         return True
 
@@ -137,6 +136,7 @@ def save_config(config_data: dict) -> bool:
                 msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
             except Exception:
                 pass
+        if lock_fd:
             try:
                 lock_fd.close()
             except Exception:
@@ -144,7 +144,7 @@ def save_config(config_data: dict) -> bool:
 
 
 def update_eye_contact_config(intensity: int = None, enabled: bool = None) -> dict:
-    """Función de conveniencia para actualizar solo las variables de Eye Contact."""
+    """Actualiza y persiste las variables de Eye Contact."""
     cfg = load_config()
     eye_cfg = cfg.setdefault("eye_contact", {})
 
@@ -157,6 +157,22 @@ def update_eye_contact_config(intensity: int = None, enabled: bool = None) -> di
 
     if enabled is not None:
         eye_cfg["enabled"] = bool(enabled)
+
+    save_config(cfg)
+    return cfg
+
+
+def update_teleprompter_config(scroll_speed: int = None, font_size: int = None, opacity: int = None) -> dict:
+    """Actualiza y persiste las preferencias del Teleprompter."""
+    cfg = load_config()
+    tele_cfg = cfg.setdefault("teleprompter", {})
+
+    if scroll_speed is not None:
+        tele_cfg["scroll_speed"] = max(1, min(10, int(scroll_speed)))
+    if font_size is not None:
+        tele_cfg["font_size"] = max(16, min(44, int(font_size)))
+    if opacity is not None:
+        tele_cfg["opacity"] = max(80, min(255, int(opacity)))
 
     save_config(cfg)
     return cfg

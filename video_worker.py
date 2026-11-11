@@ -1,17 +1,15 @@
 """
 video_worker.py - Módulo B: Motor de Video y Contacto Visual Blindado (V2.0 Final)
-Incluye Threaded Frame Grabber con Frame ID Atómico, Sincronización vcam,
-Reset Adaptativo de EMA, Compuerta Head-Pose 3D, y emisión periódica de telemetría.
+Incluye apertura única de cámara con resolución adaptativa, Threaded Frame Grabber con Frame ID Atómico,
+Sincronización vcam, Reset Adaptativo de EMA y Compuerta Head-Pose 3D corregida.
 """
 
 import sys
 import time
-import queue
 import signal
 import threading
 import traceback
 from multiprocessing import Queue
-from multiprocessing.connection import Connection
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -27,43 +25,61 @@ RIGHT_EAR_POINTS = {'p1': 362, 'p4': 263, 'p2': 385, 'p6': 380, 'p3': 387, 'p5':
 LEFT_IRIS_CENTER = 468
 RIGHT_IRIS_CENTER = 473
 
+# Coordenadas 3D alineadas con el espacio de imagen de OpenCV (Y positivo hacia abajo)
 CANONICAL_FACE_3D = np.array([
-    (0.0, 0.0, 0.0),
-    (0.0, -330.0, -65.0),
-    (-225.0, 170.0, -135.0),
-    (225.0, 170.0, -135.0),
-    (-150.0, -150.0, -125.0),
-    (150.0, -150.0, -125.0)
+    (0.0, 0.0, 0.0),          # Punta de la nariz (1)
+    (0.0, 330.0, -65.0),      # Mentón (152)
+    (-225.0, -170.0, -135.0), # Comisura externa ojo izquierdo (33)
+    (225.0, -170.0, -135.0),  # Comisura externa ojo derecho (263)
+    (-150.0, 150.0, -125.0),  # Comisura izquierda boca (61)
+    (150.0, 150.0, -125.0)    # Comisura derecha boca (291)
 ], dtype=np.float64)
 
 
 class ThreadedCameraCapture:
-    def __init__(self, cam_index=0, width=1280, height=720, fps=30):
-        self.cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
-        if not self.cap.isOpened():
-            self.cap = cv2.VideoCapture(cam_index)
-
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.cap.set(cv2.CAP_PROP_FPS, fps)
-
-        self.lock = threading.Lock()
-        self.stopped = False
+    """Captura de cámara en hilo dedicado con apertura única y detección real de resolución."""
+    def __init__(self, max_indices=4, req_width=1280, req_height=720, fps=30):
+        self.cap = None
         self.latest_frame = None
         self.ret = False
         self.frame_id = 0
+        self.actual_width = req_width
+        self.actual_height = req_height
 
-        self.ret, self.latest_frame = self.cap.read()
-        if self.ret:
-            self.frame_id = 1
+        for idx in range(max_indices):
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(idx)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, req_width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, req_height)
+                cap.set(cv2.CAP_PROP_FPS, fps)
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    self.cap = cap
+                    self.ret = True
+                    self.latest_frame = frame
+                    self.frame_id = 1
+                    self.actual_height, self.actual_width = frame.shape[:2]
+                    break
+                cap.release()
+
+        if self.cap is None:
+            self.cap = cv2.VideoCapture(0)
+
+        self.lock = threading.Lock()
+        self.stopped = False
 
         self.thread = threading.Thread(target=self._capture_loop, daemon=True, name="CameraGrabberThread")
         self.thread.start()
 
     def _capture_loop(self):
         while not self.stopped:
+            if self.cap is None or not self.cap.isOpened():
+                time.sleep(0.02)
+                continue
             ret, frame = self.cap.read()
-            if ret:
+            if ret and frame is not None:
                 with self.lock:
                     self.latest_frame = frame
                     self.ret = True
@@ -81,28 +97,14 @@ class ThreadedCameraCapture:
         self.stopped = True
         if self.thread.is_alive():
             self.thread.join(timeout=1.0)
-        if self.cap.isOpened():
+        if self.cap is not None and self.cap.isOpened():
             self.cap.release()
 
 
-def find_working_camera(max_indices_to_test=4) -> int:
-    for idx in range(max_indices_to_test):
-        test_cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        if not test_cap.isOpened():
-            test_cap = cv2.VideoCapture(idx)
-
-        if test_cap.isOpened():
-            ret, _ = test_cap.read()
-            test_cap.release()
-            if ret:
-                return idx
-    return 0
-
-
 class EyeContactEngine:
-    def __init__(self, vertical_shift_px=5, horizontal_inward_px=1, ear_threshold=0.19, ema_alpha=0.75):
-        self.vertical_shift_px = vertical_shift_px
-        self.horizontal_inward_px = horizontal_inward_px
+    def __init__(self, vertical_shift_px=5.0, horizontal_inward_px=1.0, ear_threshold=0.19, ema_alpha=0.75):
+        self.vertical_shift_px = float(vertical_shift_px)
+        self.horizontal_inward_px = float(horizontal_inward_px)
         self.ear_threshold = ear_threshold
         self.ema_alpha = ema_alpha
         self.correction_enabled = True
@@ -133,7 +135,13 @@ class EyeContactEngine:
         return float((vert_1 + vert_2) / (2.0 * horiz))
 
     @staticmethod
-    def calculate_head_pose_gating(landmarks, img_w, img_h) -> float:
+    def _normalize_head_angle(angle_deg: float) -> float:
+        """Normaliza ángulos de Euler alrededor de 0° independientemente de giros de 180° en ejes."""
+        a = abs(float(angle_deg)) % 180.0
+        return min(a, 180.0 - a)
+
+    @classmethod
+    def calculate_head_pose_gating(cls, landmarks, img_w, img_h) -> float:
         image_points = np.array([
             (landmarks[1].x * img_w, landmarks[1].y * img_h),
             (landmarks[152].x * img_w, landmarks[152].y * img_h),
@@ -143,7 +151,7 @@ class EyeContactEngine:
             (landmarks[291].x * img_w, landmarks[291].y * img_h)
         ], dtype=np.float64)
 
-        focal_length = img_w
+        focal_length = float(img_w)
         center = (img_w / 2.0, img_h / 2.0)
         camera_matrix = np.array([
             [focal_length, 0.0, center[0]],
@@ -160,15 +168,16 @@ class EyeContactEngine:
 
         rmat, _ = cv2.Rodrigues(rvec)
         angles, _, _, _, _, _ = cv2.RQDecomp3x3(rmat)
-        pitch, yaw = abs(angles[0]), abs(angles[1])
+        pitch = cls._normalize_head_angle(angles[0])
+        yaw = cls._normalize_head_angle(angles[1])
 
         max_angle = max(pitch, yaw)
-        if max_angle >= 22.0:
+        if max_angle >= 25.0:
             return 0.0
         elif max_angle <= 15.0:
             return 1.0
         else:
-            return float((22.0 - max_angle) / (22.0 - 15.0))
+            return float((25.0 - max_angle) / (25.0 - 15.0))
 
     @staticmethod
     def get_square_bbox(landmarks, indices, img_w, img_h, padding_ratio=0.35):
@@ -198,7 +207,7 @@ class EyeContactEngine:
     def correct_iris_patch(self, eye_crop: np.ndarray, iris_center_local, iris_center_global, is_left: bool, gating_factor: float) -> np.ndarray:
         h, w = eye_crop.shape[:2]
         ix, iy = int(round(iris_center_local[0])), int(round(iris_center_local[1]))
-        radius = max(3, int(w * 0.16))
+        radius = max(5, int(w * 0.24))
 
         dx = (self.horizontal_inward_px if is_left else -self.horizontal_inward_px) * gating_factor
         dy = (-self.vertical_shift_px) * gating_factor
@@ -224,9 +233,13 @@ class EyeContactEngine:
             smoothed_offset = self.ema_alpha * raw_offset + (1.0 - self.ema_alpha) * self.prev_right_offset
             self.prev_right_offset = smoothed_offset
 
+        # La máscara cubre tanto el origen como el destino desplazado del iris para evitar recortes
         iris_mask = np.zeros((h, w), dtype=np.float32)
+        shifted_ix = int(round(ix + smoothed_offset[0]))
+        shifted_iy = int(round(iy + smoothed_offset[1]))
         cv2.circle(iris_mask, (ix, iy), radius, 1.0, -1)
-        iris_mask = cv2.GaussianBlur(iris_mask, (9, 9), 0)[..., np.newaxis]
+        cv2.circle(iris_mask, (shifted_ix, shifted_iy), radius, 1.0, -1)
+        iris_mask = cv2.GaussianBlur(iris_mask, (11, 11), 0)[..., np.newaxis]
 
         M = np.float32([[1.0, 0.0, smoothed_offset[0]], [0.0, 1.0, smoothed_offset[1]]])
         shifted_crop = cv2.warpAffine(eye_crop, M, (w, h), borderMode=cv2.BORDER_REFLECT)
@@ -289,8 +302,9 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
     except (ValueError, AttributeError):
         pass
 
-    cam_index = find_working_camera()
-    grabber = ThreadedCameraCapture(cam_index=cam_index, width=width, height=height, fps=fps)
+    grabber = ThreadedCameraCapture(req_width=width, req_height=height, fps=fps)
+    actual_w = grabber.actual_width
+    actual_h = grabber.actual_height
 
     mp_face_mesh = mp.solutions.face_mesh
     face_mesh = mp_face_mesh.FaceMesh(
@@ -311,7 +325,7 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
         engine = EyeContactEngine(vertical_shift_px=v_shift, horizontal_inward_px=h_shift)
         engine.correction_enabled = initial_enabled
     else:
-        engine = EyeContactEngine(vertical_shift_px=5, horizontal_inward_px=1)
+        engine = EyeContactEngine(vertical_shift_px=5.0, horizontal_inward_px=1.0)
 
     last_processed_frame_id = -1
     vcam_instance = None
@@ -319,7 +333,12 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
 
     try:
         try:
-            vcam_ctx = pyvirtualcam.Camera(width=width, height=height, fps=fps, fmt=pyvirtualcam.PixelFormat.BGR)
+            vcam_ctx = pyvirtualcam.Camera(
+                width=actual_w,
+                height=actual_h,
+                fps=fps,
+                fmt=pyvirtualcam.PixelFormat.BGR
+            )
         except Exception as vcam_err:
             print(f"[VIDEO WORKER AVISO] OBS Virtual Camera no disponible: {vcam_err}", file=sys.stderr)
             if ack_pipe is not None:
@@ -335,7 +354,7 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
             while not stop_event.is_set():
                 if cmd_pipe is not None:
                     try:
-                        if cmd_pipe.poll():
+                        while cmd_pipe.poll():
                             msg = cmd_pipe.recv()
                             if isinstance(msg, dict):
                                 cmd = msg.get("cmd")
@@ -343,9 +362,9 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
                                     stop_event.set()
                                     break
                                 elif cmd == "TOGGLE_CORRECTION":
-                                    engine.correction_enabled = msg.get("enabled", True)
+                                    engine.correction_enabled = bool(msg.get("enabled", True))
                                 elif cmd == "SET_SHIFT":
-                                    engine.vertical_shift_px = msg.get("shift_px", 5)
+                                    engine.vertical_shift_px = float(msg.get("shift_px", 5.0))
                                 elif cmd == "SET_INTENSITY":
                                     if enable_level1:
                                         intensity_val = msg.get("intensity", 50)
@@ -354,8 +373,14 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
                                         engine.horizontal_inward_px = h_val
                                         if "enabled" in msg:
                                             engine.correction_enabled = bool(msg.get("enabled", True))
+                    except EOFError:
+                        stop_event.set()
+                        break
                     except Exception:
                         pass
+
+                if stop_event.is_set():
+                    break
 
                 ret, frame, current_frame_id = grabber.read()
                 if not ret or frame is None:
@@ -369,12 +394,16 @@ def run_video_worker(cmd_pipe=None, ack_pipe=None, ipc_queue: Queue = None, widt
                 last_processed_frame_id = current_frame_id
                 frame_counter += 1
 
+                fh, fw = frame.shape[:2]
+                if fw != actual_w or fh != actual_h:
+                    frame = cv2.resize(frame, (actual_w, actual_h))
+
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = face_mesh.process(rgb_frame)
 
                 if results.multi_face_landmarks:
                     landmarks = results.multi_face_landmarks[0].landmark
-                    frame = engine.process_frame(frame, landmarks, width, height)
+                    frame = engine.process_frame(frame, landmarks, actual_w, actual_h)
                 else:
                     engine.current_state = "GRAY"
 

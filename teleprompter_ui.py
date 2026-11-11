@@ -1,7 +1,8 @@
 """
 teleprompter_ui.py - Módulo A: Teleprompter Invisible para Windows (PyQt6)
 Incluye Atajos Globales (RegisterHotKey F8/F9/F10), Drag & Drop de guiones,
-barra retráctil HUD de controles (fuente, opacidad, velocidad) y distintivo de estado.
+arrastre desde cualquier área de la ventana, botón de cierre, barra retráctil HUD
+de controles (fuente, opacidad, velocidad, mirada) y distintivo LED real de estado.
 """
 
 import sys
@@ -9,8 +10,8 @@ import os
 import ctypes
 from ctypes import wintypes
 import config_manager
-from PyQt6.QtCore import Qt, QTimer, QPoint
-from PyQt6.QtGui import QKeyEvent, QMouseEvent, QDropEvent, QDragEnterEvent, QFont
+from PyQt6.QtCore import Qt, QTimer, QEvent
+from PyQt6.QtGui import QKeyEvent, QMouseEvent, QDropEvent, QDragEnterEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -59,11 +60,13 @@ class InvisibleTeleprompter(QMainWindow):
         self.eye_contact_intensity = self.config.get("eye_contact", {}).get("intensity", 50)
         self.eye_contact_enabled = self.config.get("eye_contact", {}).get("enabled", True)
 
+        tele_cfg = self.config.get("teleprompter", {})
         self.is_paused = False
-        self.scroll_speed = 3
+        self.scroll_speed = int(tele_cfg.get("scroll_speed", 3))
         self.base_interval_ms = 40
-        self.current_font_size = 24
-        self.current_opacity = 215  # Canal alfa 0-255
+        self.current_font_size = int(tele_cfg.get("font_size", 24))
+        self.current_opacity = int(tele_cfg.get("opacity", 215))  # Canal alfa 80-255
+
         self._drag_pos = None
         self._screen_listener_connected = False
         self._current_screen = None
@@ -91,23 +94,13 @@ class InvisibleTeleprompter(QMainWindow):
         root_layout.setContentsMargins(12, 12, 12, 12)
         root_layout.setSpacing(6)
 
-        # Barra Superior: Estado, Atajos y LED
+        # Barra Superior: Estado, Atajos, HUD y Cerrar
         self.header_bar = QHBoxLayout()
 
-        self.led_badge = QLabel("● Cámara: Activa")
-        self.led_badge.setStyleSheet("""
-            QLabel {
-                color: #22C55E;
-                font-family: 'Segoe UI', sans-serif;
-                font-size: 11px;
-                font-weight: 700;
-                background-color: rgba(34, 197, 94, 0.15);
-                padding: 2px 6px;
-                border-radius: 4px;
-            }
-        """)
+        self.led_badge = QLabel()
+        self._update_led_badge()
 
-        self.status_label = QLabel(f"Vel: {self.scroll_speed} | [F8] Pausa | [F9/F10] Vel | [F2] HUD")
+        self.status_label = QLabel(f"Vel: {self.scroll_speed} | [F8] Pausa | [F9/F10] Vel | [F2] HUD | [Esc] Salir")
         self.status_label.setStyleSheet("""
             QLabel {
                 color: #A0AEC0;
@@ -133,19 +126,39 @@ class InvisibleTeleprompter(QMainWindow):
         """)
         self.hud_toggle_btn.clicked.connect(self._toggle_hud)
 
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedSize(22, 20)
+        self.close_btn.setToolTip("Cerrar Teleprompter (Esc)")
+        self.close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #334155;
+                color: #F8FAFC;
+                font-size: 11px;
+                font-weight: bold;
+                border-radius: 3px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #EF4444; color: #FFFFFF; }
+        """)
+        self.close_btn.clicked.connect(self.close)
+
         self.header_bar.addWidget(self.led_badge)
         self.header_bar.addWidget(self.status_label)
         self.header_bar.addStretch()
         self.header_bar.addWidget(self.hud_toggle_btn)
+        self.header_bar.addWidget(self.close_btn)
         root_layout.addLayout(self.header_bar)
 
-        # Editor de Texto Principal
+        # Editor de Texto Principal (sin robar foco de teclado y permitiendo arrastrar la ventana)
         self.text_editor = QTextEdit()
         self.text_editor.setReadOnly(True)
+        self.text_editor.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.text_editor.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.text_editor.viewport().installEventFilter(self)
         self._update_editor_style()
         root_layout.addWidget(self.text_editor)
 
-        # Barra Retráctil HUD (Opacidad, Fuente, Velocidad)
+        # Barra Retráctil HUD (Opacidad, Fuente, Velocidad y Mirada)
         self.hud_frame = QFrame()
         self.hud_frame.setStyleSheet("""
             QFrame {
@@ -215,6 +228,64 @@ class InvisibleTeleprompter(QMainWindow):
         container.setLayout(root_layout)
         self.setCentralWidget(container)
 
+    def _update_led_badge(self):
+        """Actualiza el indicador superior reflejando fielmente si la cámara está activa o apagada."""
+        if not hasattr(self, "led_badge"):
+            return
+        if not self.is_eye_contact_active:
+            self.led_badge.setText("● Modo Lectura (Sin Cámara)")
+            self.led_badge.setStyleSheet("""
+                QLabel {
+                    color: #38BDF8;
+                    font-family: 'Segoe UI', sans-serif;
+                    font-size: 11px;
+                    font-weight: 700;
+                    background-color: rgba(56, 189, 248, 0.15);
+                    padding: 2px 6px;
+                    border-radius: 4px;
+                }
+            """)
+        elif self.eye_contact_enabled:
+            self.led_badge.setText("● Eye Contact: Activo")
+            self.led_badge.setStyleSheet("""
+                QLabel {
+                    color: #22C55E;
+                    font-family: 'Segoe UI', sans-serif;
+                    font-size: 11px;
+                    font-weight: 700;
+                    background-color: rgba(34, 197, 94, 0.15);
+                    padding: 2px 6px;
+                    border-radius: 4px;
+                }
+            """)
+        else:
+            self.led_badge.setText("● Eye Contact: Pausado")
+            self.led_badge.setStyleSheet("""
+                QLabel {
+                    color: #F59E0B;
+                    font-family: 'Segoe UI', sans-serif;
+                    font-size: 11px;
+                    font-weight: 700;
+                    background-color: rgba(245, 158, 11, 0.15);
+                    padding: 2px 6px;
+                    border-radius: 4px;
+                }
+            """)
+
+    def eventFilter(self, obj, event):
+        """Permite arrastrar la ventana del teleprompter haciendo clic sobre el área de texto."""
+        if obj == self.text_editor.viewport():
+            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                return True
+            elif event.type() == QEvent.Type.MouseMove and (event.buttons() & Qt.MouseButton.LeftButton) and self._drag_pos is not None:
+                self.move(event.globalPosition().toPoint() - self._drag_pos)
+                return True
+            elif event.type() == QEvent.Type.MouseButtonRelease:
+                self._drag_pos = None
+                return True
+        return super().eventFilter(obj, event)
+
     def _update_editor_style(self):
         self.text_editor.setStyleSheet(f"""
             QTextEdit {{
@@ -242,11 +313,11 @@ class InvisibleTeleprompter(QMainWindow):
         self.text_editor.setPlainText(
             "Bienvenido a DashEyes V2.0\n\n"
             "Atajos Globales Activos (puedes estar en PowerPoint o Zoom):\n"
-            "• [F8]: Pausar o reanudar el scroll desde cualquier app.\n"
-            "• [F9]: Disminuir velocidad globalmente.\n"
-            "• [F10]: Aumentar velocidad globalmente.\n"
-            "• [F2]: Mostrar u ocultar barra de controles HUD.\n\n"
-            "Arrastra y suelta cualquier archivo .txt o .md sobre esta ventana "
+            "• [F8] o [Espacio]: Pausar o reanudar el scroll.\n"
+            "• [F9] / [F10]: Disminuir o aumentar velocidad globalmente.\n"
+            "• [F2]: Mostrar u ocultar barra de controles HUD.\n"
+            "• [Esc] o botón [✕]: Cerrar el teleprompter.\n\n"
+            "Arrastra esta ventana desde cualquier parte o suelta un archivo .txt / .md "
             "para cargar tu presentación al instante."
         )
 
@@ -259,14 +330,17 @@ class InvisibleTeleprompter(QMainWindow):
     def _on_font_size_changed(self, val):
         self.current_font_size = val
         self._update_editor_style()
+        config_manager.update_teleprompter_config(font_size=val)
 
     def _on_opacity_changed(self, val):
         self.current_opacity = val
         self._update_editor_style()
+        config_manager.update_teleprompter_config(opacity=val)
 
     def _on_speed_slider_changed(self, val):
         self.scroll_speed = val
         self._update_timer_speed()
+        config_manager.update_teleprompter_config(scroll_speed=val)
 
     def _update_eye_toggle_style(self):
         if not hasattr(self, "eye_toggle_btn"):
@@ -314,6 +388,7 @@ class InvisibleTeleprompter(QMainWindow):
     def _on_eye_toggle_clicked(self):
         self.eye_contact_enabled = not self.eye_contact_enabled
         self._update_eye_toggle_style()
+        self._update_led_badge()
         if self.ipc_pipe is not None:
             try:
                 self.ipc_pipe.send({
@@ -324,18 +399,6 @@ class InvisibleTeleprompter(QMainWindow):
                 pass
         config_manager.update_eye_contact_config(enabled=self.eye_contact_enabled)
 
-    def closeEvent(self, event):
-        if self.ipc_pipe is not None:
-            try:
-                self.ipc_pipe.send({"cmd": "STOP"})
-            except Exception:
-                pass
-            try:
-                self.ipc_pipe.close()
-            except Exception:
-                pass
-        event.accept()
-
     def _init_scroll_timer(self):
         self.scroll_timer = QTimer(self)
         self.scroll_timer.timeout.connect(self._scroll_tick)
@@ -345,9 +408,12 @@ class InvisibleTeleprompter(QMainWindow):
     def _update_timer_speed(self):
         interval = max(8, int(self.base_interval_ms - (self.scroll_speed - 3) * 6))
         self.scroll_timer.setInterval(interval)
-        self.speed_slider.setValue(self.scroll_speed)
+        if hasattr(self, "speed_slider") and self.speed_slider.value() != self.scroll_speed:
+            self.speed_slider.blockSignals(True)
+            self.speed_slider.setValue(self.scroll_speed)
+            self.speed_slider.blockSignals(False)
         state_str = "PAUSADO" if self.is_paused else f"Vel: {self.scroll_speed}"
-        self.status_label.setText(f"[{state_str}] | [F8] Pausa | [F9/F10] Vel | [F2] HUD")
+        self.status_label.setText(f"[{state_str}] | [F8] Pausa | [F9/F10] Vel | [F2] HUD | [Esc] Salir")
 
     def _scroll_tick(self):
         if not self.is_paused:
@@ -375,7 +441,7 @@ class InvisibleTeleprompter(QMainWindow):
                     pass
 
     # --------------------------------------------------------------------------
-    # REGISTRO Y GESTIÓN DE GLOBAL HOTKEYS (Win32 RegisterHotKey)
+    # REGISTRO Y GESTIÓN DE GLOBAL HOTKEYS Y CIERRE UNIFICADO
     # --------------------------------------------------------------------------
     def showEvent(self, event):
         super().showEvent(event)
@@ -395,13 +461,28 @@ class InvisibleTeleprompter(QMainWindow):
             self._screen_listener_connected = True
 
     def closeEvent(self, event):
+        """Cierre único y unificado: libera Hotkeys Win32 y notifica STOP por la tubería IPC."""
         if self._hotkeys_registered:
-            hwnd = int(self.winId())
-            user32 = ctypes.windll.user32
-            user32.UnregisterHotKey(hwnd, HOTKEY_F8_ID)
-            user32.UnregisterHotKey(hwnd, HOTKEY_F9_ID)
-            user32.UnregisterHotKey(hwnd, HOTKEY_F10_ID)
+            try:
+                hwnd = int(self.winId())
+                user32 = ctypes.windll.user32
+                user32.UnregisterHotKey(hwnd, HOTKEY_F8_ID)
+                user32.UnregisterHotKey(hwnd, HOTKEY_F9_ID)
+                user32.UnregisterHotKey(hwnd, HOTKEY_F10_ID)
+            except Exception:
+                pass
             self._hotkeys_registered = False
+
+        if self.ipc_pipe is not None:
+            try:
+                self.ipc_pipe.send({"cmd": "STOP"})
+            except Exception:
+                pass
+            try:
+                self.ipc_pipe.close()
+            except Exception:
+                pass
+
         event.accept()
 
     def nativeEvent(self, event_type, message):
@@ -418,11 +499,13 @@ class InvisibleTeleprompter(QMainWindow):
                     if self.scroll_speed > 1:
                         self.scroll_speed -= 1
                         self._update_timer_speed()
+                        config_manager.update_teleprompter_config(scroll_speed=self.scroll_speed)
                     return True, 0
                 elif hotkey_id == HOTKEY_F10_ID:
                     if self.scroll_speed < 10:
                         self.scroll_speed += 1
                         self._update_timer_speed()
+                        config_manager.update_teleprompter_config(scroll_speed=self.scroll_speed)
                     return True, 0
         return super().nativeEvent(event_type, message)
 
@@ -448,10 +531,12 @@ class InvisibleTeleprompter(QMainWindow):
             if self.scroll_speed < 10:
                 self.scroll_speed += 1
                 self._update_timer_speed()
+                config_manager.update_teleprompter_config(scroll_speed=self.scroll_speed)
         elif key == Qt.Key.Key_Down:
             if self.scroll_speed > 1:
                 self.scroll_speed -= 1
                 self._update_timer_speed()
+                config_manager.update_teleprompter_config(scroll_speed=self.scroll_speed)
         elif key == Qt.Key.Key_Escape:
             self.close()
         else:

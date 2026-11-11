@@ -1,7 +1,8 @@
 """
 dashboard.py - Centro de Control y Diagnóstico de DashEyes (V2.0 Dual Mode)
 Arquitectura de arranque dual: Modo Teleprompter (sin admin/sin OBS) y Modo Eye Contact (Beta).
-Incluye UAC bajo demanda (ShellExecuteW 'runas') y QSystemTrayIcon.
+Incluye enrutamiento limpio para PyInstaller (--mode), icono nativo para QSystemTrayIcon,
+bloqueo anti-duplicación de procesos y UAC bajo demanda (ShellExecuteW 'runas').
 """
 
 import sys
@@ -16,8 +17,8 @@ import subprocess
 import webbrowser
 import importlib
 import config_manager
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QBrush, QPen
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -35,6 +36,35 @@ from PyQt6.QtWidgets import (
     QSlider,
     QCheckBox,
 )
+
+
+def create_dasheyes_icon() -> QIcon:
+    """Genera un icono vectorial en memoria para la ventana y la bandeja del sistema."""
+    pixmap = QPixmap(64, 64)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    # Fondo circular oscuro
+    painter.setBrush(QBrush(QColor("#0F172A")))
+    painter.setPen(QPen(QColor("#38BDF8"), 4))
+    painter.drawEllipse(4, 4, 56, 56)
+
+    # Contorno de ojo estilizado
+    painter.setBrush(QBrush(QColor("#38BDF8")))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawEllipse(16, 20, 32, 24)
+
+    # Pupila central
+    painter.setBrush(QBrush(QColor("#0F172A")))
+    painter.drawEllipse(26, 26, 12, 12)
+
+    # Brillo corneal
+    painter.setBrush(QBrush(QColor("#FFFFFF")))
+    painter.drawEllipse(33, 28, 4, 4)
+
+    painter.end()
+    return QIcon(pixmap)
 
 
 class DiagnosticWorker(QThread):
@@ -68,7 +98,7 @@ class DiagnosticWorker(QThread):
             with pyvirtualcam.Camera(width=640, height=480, fps=30) as cam:
                 results["obs_driver_ok"] = True
                 results["obs_details"] = f"Driver Detectado ({cam.device})"
-        except Exception as e:
+        except Exception:
             results["obs_driver_ok"] = False
             results["obs_details"] = "Driver no detectado o en uso"
 
@@ -117,10 +147,15 @@ class DashEyesDashboard(QMainWindow):
         self.dash_process = None
         self.install_worker = None
         self.selected_script_path = None
+        self.can_use_eye_contact = False
+
+        self.app_icon = create_dasheyes_icon()
+        self.setWindowIcon(self.app_icon)
 
         self._init_window()
         self._init_tray_icon()
         self._init_ui()
+        self._init_process_monitor()
         self.run_diagnostics()
 
     def _init_window(self):
@@ -133,7 +168,8 @@ class DashEyesDashboard(QMainWindow):
 
     def _init_tray_icon(self):
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(self.windowIcon())
+        self.tray_icon.setIcon(self.app_icon)
+        self.tray_icon.setToolTip("DashEyes V2.0 - Centro de Control")
 
         tray_menu = QMenu()
         show_action = tray_menu.addAction("Mostrar Dashboard")
@@ -149,6 +185,23 @@ class DashEyesDashboard(QMainWindow):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.showNormal()
             self.activateWindow()
+
+    def _init_process_monitor(self):
+        """Monitorea si el subproceso activo se cerró para rehabilitar los botones automáticamente."""
+        self.process_monitor_timer = QTimer(self)
+        self.process_monitor_timer.setInterval(500)
+        self.process_monitor_timer.timeout.connect(self._check_running_process)
+        self.process_monitor_timer.start()
+
+    def _check_running_process(self):
+        if self.dash_process is not None and self.dash_process.poll() is not None:
+            self.dash_process = None
+            self.launch_teleprompter_btn.setEnabled(True)
+            self.launch_teleprompter_btn.setText("Iniciar Modo Teleprompter (Sin Admin / Rápido)")
+            self.launch_eye_contact_btn.setEnabled(self.can_use_eye_contact)
+            self.launch_eye_contact_btn.setText("Iniciar Modo Eye Contact (Beta / Requiere OBS)")
+            if getattr(self, "enable_level1", False) and hasattr(self, "calibration_frame"):
+                self.calibration_frame.setEnabled(self.can_use_eye_contact)
 
     def _init_ui(self):
         central_widget = QWidget()
@@ -329,6 +382,7 @@ class DashEyesDashboard(QMainWindow):
                 border: none;
             }
             QPushButton:hover { background-color: #047857; }
+            QPushButton:disabled { background-color: #1E293B; color: #64748B; }
         """)
         self.launch_teleprompter_btn.clicked.connect(self.on_launch_teleprompter_clicked)
         layout.addWidget(self.launch_teleprompter_btn)
@@ -366,7 +420,7 @@ class DashEyesDashboard(QMainWindow):
             }
             QPushButton:hover { background-color: #1E293B; color: #F8FAFC; }
         """)
-        self.exit_btn.clicked.connect(self.close)
+        self.exit_btn.clicked.connect(self._force_exit)
         layout.addWidget(self.exit_btn)
 
         central_widget.setLayout(layout)
@@ -473,13 +527,15 @@ class DashEyesDashboard(QMainWindow):
             )
 
         # 3. Driver OBS Virtual Camera
+        self.can_use_eye_contact = bool(res["obs_driver_ok"] and res["packages_ok"])
+        is_running = self.dash_process is not None and self.dash_process.poll() is None
+
         if res["obs_driver_ok"]:
             self.obs_badge[1].setText("OK (DirectShow Activo)")
             self.obs_badge[1].setStyleSheet(
                 "color: #22C55E; background-color: rgba(34, 197, 94, 0.15); padding: 3px 8px; border-radius: 4px; font-weight: bold;"
             )
-            # Solo se habilita el modo Eye Contact si el driver está presente
-            self.launch_eye_contact_btn.setEnabled(res["packages_ok"])
+            self.launch_eye_contact_btn.setEnabled(self.can_use_eye_contact and not is_running)
         else:
             self.obs_badge[1].setText("No Detectado (Eye Contact Inactivo)")
             self.obs_badge[1].setStyleSheet(
@@ -487,21 +543,30 @@ class DashEyesDashboard(QMainWindow):
             )
             self.launch_eye_contact_btn.setEnabled(False)
 
-        # El modo Teleprompter SIEMPRE está habilitado
-        self.launch_teleprompter_btn.setEnabled(True)
+        self.launch_teleprompter_btn.setEnabled(not is_running)
 
-        # Control de habilitación del panel de calibración de Eye Contact
         if getattr(self, "enable_level1", False) and hasattr(self, "calibration_frame"):
-            can_eye = bool(res["obs_driver_ok"] and res["packages_ok"])
-            self.calibration_frame.setEnabled(can_eye)
+            self.calibration_frame.setEnabled(self.can_use_eye_contact and not is_running)
 
     def on_repair_clicked(self):
         """Elevación de UAC bajo demanda usando ShellExecuteW 'runas' solo si no es admin."""
+        if getattr(sys, "frozen", False):
+            reply = QMessageBox.question(
+                self,
+                "Driver de Cámara Virtual",
+                "En la versión ejecutable todos los paquetes de Python ya están incluidos.\n\n"
+                "¿Deseas abrir la página oficial de OBS Studio para instalar OBS Virtual Camera?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                webbrowser.open("https://obsproject.com/download")
+            self.run_diagnostics()
+            return
+
         is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
-        req_file = os.path.join(os.path.dirname(__file__), "requirements.txt")
+        req_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
 
         if not is_admin:
-            # Solicitar elevación UAC en Windows
             script_path = os.path.abspath(__file__)
             params = f'"{script_path}" --elevated-repair'
             ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
@@ -512,10 +577,9 @@ class DashEyesDashboard(QMainWindow):
                     "Se ha solicitado elevación de Administrador para instalar dependencias.\n"
                     "Al finalizar la ventana de instalación, pulsa Aceptar para refrescar el estado."
                 )
-            self.run_diagnostics()
+                self.run_diagnostics()
             return
 
-        # Si ya es admin, ejecutar hilo de instalación estándar
         self.progress_bar.show()
         self.repair_btn.setEnabled(False)
         self.repair_btn.setText("Instalando paquetes...")
@@ -545,34 +609,44 @@ class DashEyesDashboard(QMainWindow):
 
         self.run_diagnostics()
 
+    def _build_launch_command(self, mode: str) -> list:
+        """Construye el comando compatible tanto con script Python como con ejecutable PyInstaller."""
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--mode", mode]
+        else:
+            main_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
+            cmd = [sys.executable, main_py, "--mode", mode]
+
+        if self.selected_script_path:
+            cmd.extend(["--script", self.selected_script_path])
+        return cmd
+
     def on_launch_teleprompter_clicked(self):
         """Lanza exclusivamente el Modo Teleprompter (Liviano / Sin OBS / Sin Admin)."""
+        if self.dash_process is not None and self.dash_process.poll() is None:
+            QMessageBox.information(self, "Sesión Activa", "DashEyes ya se encuentra en ejecución.")
+            return
+
         if getattr(self, "enable_level1", False) and hasattr(self, "calibration_frame"):
             self.calibration_frame.setEnabled(False)
 
-        main_py = os.path.join(os.path.dirname(__file__), "main.py")
-        cmd = [sys.executable, main_py, "--mode", "teleprompter"]
-        if self.selected_script_path:
-            cmd.extend(["--script", self.selected_script_path])
+        cmd = self._build_launch_command("teleprompter")
 
         try:
             self.dash_process = subprocess.Popen(cmd)
-            QMessageBox.information(
-                self,
-                "Modo Teleprompter Activo",
-                "Teleprompter invisible iniciado con éxito (Modo Liviano).\n"
-                "• Atajos: [F8] Pausa, [F9/F10] Velocidad, [F2] HUD.\n"
-                "• No consume cámara ni requiere permisos de administrador."
-            )
+            self.launch_teleprompter_btn.setEnabled(False)
+            self.launch_teleprompter_btn.setText("Modo Teleprompter en Ejecución...")
+            self.launch_eye_contact_btn.setEnabled(False)
         except Exception as e:
             QMessageBox.critical(self, "Error al Iniciar", f"No se pudo iniciar el teleprompter:\n{e}")
 
     def on_launch_eye_contact_clicked(self):
         """Lanza el Modo Eye Contact Completo (Teleprompter + Visión Artificial + Cámara Virtual)."""
-        main_py = os.path.join(os.path.dirname(__file__), "main.py")
-        cmd = [sys.executable, main_py, "--mode", "eye_contact"]
-        if self.selected_script_path:
-            cmd.extend(["--script", self.selected_script_path])
+        if self.dash_process is not None and self.dash_process.poll() is None:
+            QMessageBox.information(self, "Sesión Activa", "DashEyes ya se encuentra en ejecución.")
+            return
+
+        cmd = self._build_launch_command("eye_contact")
 
         if getattr(self, "enable_level1", False) and hasattr(self, "intensity_slider"):
             cmd.extend([
@@ -582,12 +656,9 @@ class DashEyesDashboard(QMainWindow):
 
         try:
             self.dash_process = subprocess.Popen(cmd)
-            QMessageBox.information(
-                self,
-                "Modo Eye Contact Activo",
-                "DashEyes lanzado con Corrección de Mirada y Cámara Virtual.\n"
-                "• Selecciona 'OBS Virtual Camera' en tu app de videollamada."
-            )
+            self.launch_eye_contact_btn.setEnabled(False)
+            self.launch_eye_contact_btn.setText("Modo Eye Contact en Ejecución...")
+            self.launch_teleprompter_btn.setEnabled(False)
         except Exception as e:
             QMessageBox.critical(self, "Error al Iniciar", f"No se pudo iniciar el modo Eye Contact:\n{e}")
 
@@ -607,9 +678,14 @@ class DashEyesDashboard(QMainWindow):
             event.ignore()
             return
 
+        self.tray_icon.hide()
         event.accept()
 
     def _force_exit(self):
+        if self.install_worker is not None and self.install_worker.isRunning():
+            self.install_worker.requestInterruption()
+            self.install_worker.wait(2000)
+
         if self.dash_process is not None and self.dash_process.poll() is None:
             pid = self.dash_process.pid
             try:
@@ -621,9 +697,17 @@ class DashEyesDashboard(QMainWindow):
 
 
 def main():
-    # Soporte para elevación por línea de comandos
+    mp.freeze_support()
+
+    # 1. Enrutamiento cuando se invoca con --mode (evita que el .exe duplicado abra otro Dashboard)
+    if "--mode" in sys.argv:
+        import main as orchestrator_main
+        orchestrator_main.main()
+        sys.exit(0)
+
+    # 2. Soporte para elevación por línea de comandos
     if len(sys.argv) > 1 and sys.argv[1] == "--elevated-repair":
-        req_file = os.path.join(os.path.dirname(__file__), "requirements.txt")
+        req_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
         subprocess.run([sys.executable, "-m", "pip", "install", "-r", req_file])
         sys.exit(0)
 

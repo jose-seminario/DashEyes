@@ -15,6 +15,10 @@ datas = mediapipe_datas + pyvirtualcam_datas + [
 ]
 
 hidden_imports = [
+    'main',
+    'teleprompter_ui',
+    'video_worker',
+    'config_manager',
     'mediapipe',
     'pyvirtualcam',
     'cv2',
@@ -26,7 +30,7 @@ hidden_imports = [
 ] + collect_submodules('mediapipe')
 
 a = Analysis(
-    ['dashboard.py'],
+    ['dashboard.py', 'main.py', 'teleprompter_ui.py', 'video_worker.py', 'config_manager.py'],
     pathex=['.'],
     binaries=[],
     datas=datas,
