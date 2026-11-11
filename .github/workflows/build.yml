@@ -97,7 +97,7 @@ jobs:
               } catch { }
             }
           }
-          $ok = $null -ne $exitCode -and $exitCode -eq 0 -and $null -ne $report -and $report.packages_ok -eq $true
+          $ok = $null -ne $exitCode -and $exitCode -eq 0 -and $null -ne $report -and $report.packages_ok -eq $true -and $report.face_mesh_ok -eq $true
           $results += [pscustomobject]@{ case = $case.Name; passed = $ok; exit_code = $exitCode; problem = $problem }
         }
         $results | Format-Table -AutoSize

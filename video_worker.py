@@ -98,8 +98,8 @@ class ThreadedCameraCapture:
 def require_face_mesh():
     import mediapipe
     solutions = getattr(mediapipe, "solutions", None)
-    if solutions is None or not hasattr(solutions, "face_mesh"):
-        raise RuntimeError("MediaPipe incompatible: esta versión requiere la API FaceMesh de MediaPipe 0.10.21.")
+    if not hasattr(getattr(solutions, "face_mesh", None), "FaceMesh"):
+        raise RuntimeError("MediaPipe incompatible: falta la API FaceMesh. Usa las versiones de requirements.txt.")
     return solutions.face_mesh.FaceMesh
 
 

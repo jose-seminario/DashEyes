@@ -114,10 +114,17 @@ Base propuesta: **Python 3.11 x64, Windows 10 2004+ o Windows 11**.
 - `requirements-build.txt`: añade la versión de PyInstaller.
 - OBS es un requisito externo para la cámara virtual y no se instala desde la app.
 
-Se conserva temporalmente MediaPipe **0.10.21 / FaceMesh**. Versiones modernas que
+Se conserva temporalmente MediaPipe **0.10.14 / FaceMesh**. Versiones modernas que
 no incluyen `solutions.face_mesh` se rechazan explícitamente. La migración a Tasks
 queda para otra revisión. Las dependencias transitivas todavía no tienen un lock
 completo: no se afirma reproducibilidad binaria del entorno.
+
+La selección de `0.10.14` es una medida de compatibilidad para la regresión nativa
+de `_framework_bindings` en Windows/PyInstaller, documentada en el
+[issue oficial #5838](https://github.com/google-ai-edge/mediapipe/issues/5838#issuecomment-2831803363).
+No equivale a identificar la DLL interna exacta ni a garantizar la solución en
+todos los equipos: el ejecutable debe superar CI. Es una versión legacy y no
+constituye una estrategia de mantenimiento permanente.
 
 PyInstaller tiene un único punto de entrada (`dashboard.py`) y despacha los modos
 antes de importar la interfaz. El orquestador usa colas pequeñas y una señal de
@@ -130,6 +137,7 @@ carpetas auxiliares de wheels Windows cuando existan. Un runtime hook registra
 solo rutas internas del paquete, sin instalar runtimes ni modificar el PATH del
 sistema. El diagnóstico de CI usa `--diagnose --no-camera`: verifica imports
 nativos primero en Python y luego en el ejecutable, sin abrir dispositivos.
+Además construye y cierra FaceMesh para comprobar sus grafos y modelos empaquetados.
 
 Consulta [validación](docs/VALIDATION.md), [plan de trabajo](WORK_PLAN.md) y
 [dependencias y licencias](docs/THIRD_PARTY.md). La integración continua está

@@ -47,6 +47,11 @@ class ArchitectureTests(unittest.TestCase):
         hooks = next(keyword.value for keyword in analysis.keywords if keyword.arg == "runtime_hooks")
         self.assertIn("pyi_rth_native_paths.py", ast.literal_eval(hooks))
 
+    def test_windows_legacy_binding_workaround_is_pinned(self):
+        requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+        pins = [line.strip() for line in requirements if line.strip().startswith("mediapipe")]
+        self.assertEqual(pins, ["mediapipe==0.10.14"])
+
     def test_python_sources_parse(self):
         for path in ROOT.rglob("*.py"):
             if any(part in {".git", ".dasheyes", "build", "dist", ".venv"} for part in path.parts):

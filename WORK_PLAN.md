@@ -2,7 +2,8 @@
 
 ## Restricciones respetadas
 - Lectura y edición únicamente dentro de `D:\DashEyes`.
-- Sin terminal, instalación, ejecución de la app, pruebas ni acceso a hardware.
+- Sin instalaciones, ejecución local de la app, pruebas locales ni acceso a hardware.
+- Terminal utilizada exclusivamente para comandos Git autorizados por el usuario.
 - Sin commit, push ni publicación. Se solicitará permiso antes de esas operaciones.
 
 ## Implementado en código, pendiente de ejecutar
@@ -33,7 +34,7 @@
 - [x] Versiones directas propuestas y configuración de CI actualizada.
 - [x] Suite de pruebas escrita y lista manual de validación.
 - [x] Documentación de límites, privacidad y licencias.
-- [ ] Ejecutar la suite con autorización; corregir resultados, no darla por aprobada.
+- [ ] Repetir la suite con los últimos cambios; la ejecución remota de `64d5167` superó el paso de pruebas, no el smoke test del exe.
 - [ ] Validar los modos con webcam, OBS y videollamada reales.
 - [ ] Revisar naturalidad con diferentes personas, gafas e iluminación.
 - [ ] Medir CPU, memoria, FPS y latencia en equipos con 16 GB y GPU integrada.
@@ -43,6 +44,26 @@
 - [ ] Solicitar permiso para commit/push; no publicar mientras falte validación.
 
 ## Decisiones deliberadas
+
+### Workaround respaldado por el proyecto de MediaPipe
+
+Se consultó la API pública de Actions: `64d5167` superó los pasos de pruebas
+unitarias y preflight sin empaquetar y falló en el exe. La descarga del ZIP de
+diagnósticos devolvió HTTP 401; no se ha leído ese artefacto ni se han solicitado
+credenciales al usuario.
+
+La investigación del issue oficial de MediaPipe #5838 encontró reportes del
+mismo fallo nativo con PyInstaller y un workaround explícito: volver a 0.10.14.
+Se cambió el pin de 0.10.21 a 0.10.14, manteniendo FaceMesh, Python 3.11 x64 y el
+resto de dependencias. PyPI confirma un wheel cp311-win_amd64 no retirado.
+Referencias:
+- https://github.com/google-ai-edge/mediapipe/issues/5838#issuecomment-2831803363
+- https://pypi.org/pypi/mediapipe/0.10.14/json
+
+Se mantiene la comparación del ejecutable y se exige además crear/cerrar FaceMesh
+con refinamiento de iris, sin cámara, para comprobar modelos. Se añadieron pruebas
+del fallo de modelos y del pin de compatibilidad. No se declara resuelto el
+problema hasta ejecutar la nueva versión en CI. No se ha hecho push de este ajuste.
 
 ### Incidencia de CI pendiente de diagnóstico
 

@@ -11,8 +11,18 @@ import main
 class DiagnosticsTests(unittest.TestCase):
     def _module(self, name):
         if name == "mediapipe":
+            class FakeMesh:
+                def __init__(self, **_):
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_):
+                    pass
+
             return SimpleNamespace(__version__="test", solutions=SimpleNamespace(
-                face_mesh=SimpleNamespace(FaceMesh=object),
+                face_mesh=SimpleNamespace(FaceMesh=FakeMesh),
             ))
         if name == "pyvirtualcam":
             def unexpected_camera(**_):
@@ -27,6 +37,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertLess(names.index("mediapipe"), names.index("PyQt6.QtWidgets"))
         self.assertLess(names.index("cv2"), names.index("mediapipe"))
         self.assertTrue(report["packages_ok"])
+        self.assertTrue(report["face_mesh_ok"])
         self.assertIn("omitida", report["obs_details"])
 
     def test_native_dll_failure_remains_a_failure(self):
@@ -49,6 +60,20 @@ class DiagnosticsTests(unittest.TestCase):
             report = diagnostics.diagnose(check_camera=False, native_first=True)
         self.assertEqual(imports.call_args_list[0].args[0], "mediapipe")
         self.assertTrue(report["packages_ok"])
+
+    def test_missing_model_fails_diagnostics_without_accessing_camera(self):
+        def import_module(name):
+            module = self._module(name)
+            if name == "mediapipe":
+                def broken_factory(**_):
+                    raise FileNotFoundError("face_landmark model absent")
+                module.solutions.face_mesh.FaceMesh = broken_factory
+            return module
+        with patch("diagnostics.importlib.import_module", side_effect=import_module):
+            report = diagnostics.diagnose(check_camera=False)
+        self.assertFalse(report["packages_ok"])
+        self.assertFalse(report["face_mesh_ok"])
+        self.assertIn("face_landmark model absent", report["import_errors"]["mediapipe"])
 
 
 if __name__ == "__main__":

@@ -1,8 +1,11 @@
 # Validación pendiente
 
-No se han ejecutado la aplicación, comandos, instalaciones ni pruebas durante
-esta revisión. Este documento describe comprobaciones futuras; no sus resultados.
-Las pruebas en `tests/` están escritas, no aprobadas por ejecución.
+No se han ejecutado la aplicación, instalaciones ni pruebas en la PC universitaria.
+Solo se han utilizado comandos Git para operaciones autorizadas.
+La API de GitHub confirma que la ejecución de `64d5167` superó los pasos de pruebas
+unitarias y preflight sin empaquetar, pero falló la validación del ejecutable.
+Eso no valida cámara, rendimiento ni calidad visual. Los nuevos cambios siguen
+pendientes de ejecución remota.
 
 ## Automatización preparada
 
@@ -21,6 +24,7 @@ La suite usa `unittest` y cubre:
 - Interfaz offscreen: controles, modo lectura y conservación del guion ante errores.
 - Orden de carga nativa anterior a Qt y conservación del fallo si una DLL no carga.
 - CLI de diagnóstico sin cámara y recolección explícita de DLL en el empaquetado.
+- Fallo explícito si FaceMesh importa pero no puede inicializar sus modelos.
 
 Los módulos que necesitan Qt/OpenCV se omiten si faltan sus dependencias; una
 ejecución con omisiones no valida esas áreas. El workflow completo instala las
@@ -31,6 +35,12 @@ exe después. Ambas comprobaciones usan `--no-camera`. Si falla, compartir la
 salida JSON y el artefacto `DashEyes-build-diagnostics`, que incluye el inventario
 de DLL/PYD y las advertencias de PyInstaller. Un error de `_framework_bindings`
 durante importación no demuestra ausencia de webcam ni de OBS.
+
+El diagnóstico ahora debe construir y cerrar FaceMesh con refinamiento de iris,
+sin abrir cámaras. `face_mesh_ok: true` es obligatorio para aprobar el paquete.
+Así no basta con que el import deje de fallar: se verifica también la carga de
+grafos y modelos. La corrección de compatibilidad usa MediaPipe 0.10.14 conforme
+al workaround publicado en el issue oficial #5838; falta validar nuestro exe.
 
 Para investigar el fallo persistente del paquete, CI prepara cuatro casos
 controlados (windowed/console y OpenCV-primero/MediaPipe-primero), usando el mismo

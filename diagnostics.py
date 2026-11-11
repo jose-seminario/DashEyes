@@ -27,7 +27,7 @@ def runtime_context():
 def diagnose(check_camera=True, native_first=False):
     result = {"type": "DIAGNOSTICS", "packages_ok": True, "packages_details": [],
               "obs_driver_ok": False, "obs_details": "No comprobado",
-              "runtime": runtime_context(), "import_errors": {}}
+              "runtime": runtime_context(), "import_errors": {}, "face_mesh_ok": False}
     # Reproducir el orden del proceso de vídeo. Qt pertenece a la UI y no debe
     # precargar sus DLL antes de comprobar los bindings nativos de MediaPipe.
     order = ("numpy", "cv2", "mediapipe", "pyvirtualcam", "PyQt6.QtWidgets")
@@ -37,8 +37,17 @@ def diagnose(check_camera=True, native_first=False):
     for name in order:
         try:
             module = importlib.import_module(name)
-            if name == "mediapipe" and not hasattr(getattr(getattr(module, "solutions", None), "face_mesh", None), "FaceMesh"):
-                raise RuntimeError("API FaceMesh ausente; se requiere MediaPipe 0.10.21")
+            if name == "mediapipe":
+                factory = getattr(getattr(getattr(module, "solutions", None), "face_mesh", None), "FaceMesh", None)
+                if factory is None:
+                    raise RuntimeError("API FaceMesh ausente; usa las versiones de requirements.txt")
+                # Importar no basta: validar también los grafos y modelos del paquete.
+                # No se abre ninguna cámara ni se procesa vídeo del usuario.
+                try:
+                    with factory(static_image_mode=True, max_num_faces=1, refine_landmarks=True):
+                        result["face_mesh_ok"] = True
+                except Exception as exc:
+                    raise RuntimeError(f"FaceMesh no pudo inicializar sus modelos: {exc}") from exc
             result["packages_details"].append([name, True, getattr(module, "__version__", "Disponible")])
         except Exception as exc:
             result["packages_ok"] = False

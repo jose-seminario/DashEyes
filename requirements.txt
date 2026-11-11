@@ -1,6 +1,8 @@
 # Versiones directas fijadas para la API FaceMesh. Pendientes de validar en Windows.
 PyQt6==6.7.1
 opencv-contrib-python==4.11.0.86
-mediapipe==0.10.21
+# Compatibilidad Windows/PyInstaller: regresión nativa documentada en #5838.
+# https://github.com/google-ai-edge/mediapipe/issues/5838#issuecomment-2831803363
+mediapipe==0.10.14
 pyvirtualcam==0.12.1
 numpy==1.26.4
