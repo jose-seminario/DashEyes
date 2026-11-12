@@ -34,11 +34,20 @@ def set_window_capture_invisibility(hwnd):
 
 class InvisibleTeleprompter(QMainWindow):
     def __init__(self, commands=None, events=None, previews=None, stop=None,
-                 script_path=None, settings=None, eye_mode=False):
+                 script_path=None, settings=None, eye_mode=False, shm_name=None):
         super().__init__()
         self.commands, self.events, self.previews, self.stop = commands, events, previews, stop
         self.eye_mode = eye_mode
         self.config = config_manager.normalize_config(settings or config_manager.load_config())
+        self._preview_shm = None
+        self._last_shm_seq = 0
+        if self.eye_mode and shm_name and config_manager.level2_preview_enabled(self.config):
+            try:
+                from shared_buffer import SharedPreviewBuffer
+                self._preview_shm = SharedPreviewBuffer.attach(shm_name)
+            except Exception:
+                self._preview_shm = None
+        self._level2_preview = self._preview_shm is not None
         tele = self.config["teleprompter"]
         self.scroll_speed = tele["scroll_speed"]
         self.font_size = tele["font_size"]
@@ -82,6 +91,10 @@ class InvisibleTeleprompter(QMainWindow):
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll)
         self.poll_timer.start(100)
+        self.preview_timer = QTimer(self)
+        self.preview_timer.timeout.connect(self._poll_shared_preview)
+        if self._level2_preview:
+            self.preview_timer.start(66)
         self.geometry_timer = QTimer(self)
         self.geometry_timer.setSingleShot(True)
         self.geometry_timer.timeout.connect(self._save_geometry)
@@ -162,13 +175,17 @@ class InvisibleTeleprompter(QMainWindow):
         root.addWidget(self.hud_frame)
         self.preview_container = QWidget()
         preview_layout = QVBoxLayout(self.preview_container)
-        preview_layout.addWidget(QLabel("Original (izquierda) / Corregido (derecha)"))
+        self.preview_title_label = QLabel(
+            "Vista previa en vivo (320×180)" if self._level2_preview else "Original (izquierda) / Corregido (derecha)"
+        )
+        preview_layout.addWidget(self.preview_title_label)
         self.preview_label = QLabel("Esperando imagen…")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumHeight(110)
-        self.preview_label.setMaximumHeight(150)
+        self.preview_label.setMaximumHeight(180 if self._level2_preview else 150)
         preview_layout.addWidget(self.preview_label)
-        self.preview_container.hide()
+        if not self._level2_preview:
+            self.preview_container.hide()
         root.addWidget(self.preview_container)
         self.notice_label = QLabel("F8 pausa · F9/F10 velocidad · F2 controles · Esc cerrar")
         self.notice_label.setWordWrap(True)
@@ -299,14 +316,20 @@ class InvisibleTeleprompter(QMainWindow):
     def _preview_toggled(self, enabled):
         if self._send({"cmd": "PREVIEW", "enabled": enabled}):
             self._applied_preview = enabled
-            self.preview_container.setVisible(enabled)
-            if not enabled:
-                self.preview_label.clear()
+            if self._level2_preview:
+                self.preview_title_label.setText(
+                    "Original (izquierda) / Corregido (derecha)" if enabled else "Vista previa en vivo (320×180)"
+                )
+                self.preview_container.setVisible(True)
+            else:
+                self.preview_container.setVisible(enabled)
+                if not enabled:
+                    self.preview_label.clear()
         elif hasattr(self, "preview_checkbox"):
             self.preview_checkbox.blockSignals(True)
             self.preview_checkbox.setChecked(self._applied_preview)
             self.preview_checkbox.blockSignals(False)
-            self.preview_container.setVisible(self._applied_preview)
+            self.preview_container.setVisible(True if self._level2_preview else self._applied_preview)
 
     def _scroll_tick(self):
         scrollbar = self.text_editor.verticalScrollBar()
@@ -353,14 +376,38 @@ class InvisibleTeleprompter(QMainWindow):
                     self._pending_intensity = None
                     self._pending_enabled = None
                     self._reconcile_eye_controls(intensity=self._applied_intensity, enabled=self._applied_enabled)
-        image = None
-        for data in drain(self.previews, limit=2):
-            image = data
-        if image and self.preview_container.isVisible():
-            decoded = QImage.fromData(image, "JPG")
-            if not decoded.isNull():
-                pixmap = QPixmap.fromImage(decoded)
-                self.preview_label.setPixmap(pixmap.scaled(self.preview_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        if not self._level2_preview:
+            image = None
+            for data in drain(self.previews, limit=2):
+                image = data
+            if image and self.preview_container.isVisible():
+                decoded = QImage.fromData(image, "JPG")
+                if not decoded.isNull():
+                    pixmap = QPixmap.fromImage(decoded)
+                    self.preview_label.setPixmap(pixmap.scaled(self.preview_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    def _poll_shared_preview(self):
+        if self._closing or self._preview_shm is None or not self.preview_container.isVisible():
+            return
+        if self.stop is not None and self.stop.is_set():
+            return
+        status, seq, payload = self._preview_shm.read_latest(self._last_shm_seq, max_age=1.5)
+        if status == "OK" and payload is not None:
+            self._last_shm_seq = seq
+            width, height, raw = payload
+            qimage = QImage(raw, width, height, width * 3, QImage.Format.Format_RGB888).copy()
+            if not qimage.isNull():
+                pixmap = QPixmap.fromImage(qimage)
+                self.preview_label.setPixmap(
+                    pixmap.scaled(
+                        self.preview_label.size(),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+        elif status == "STALE":
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("Sin señal de cámara (1.5 s)…")
 
     def _load_script(self, path):
         try:
@@ -485,6 +532,7 @@ class InvisibleTeleprompter(QMainWindow):
         if not self._closing:
             self._closing = True
             self.poll_timer.stop()
+            self.preview_timer.stop()
             self.scroll_timer.stop()
             self.centralWidget().setEnabled(False)
             self.geometry_timer.stop()
@@ -518,6 +566,8 @@ class InvisibleTeleprompter(QMainWindow):
                         self.writer.finished.connect(self._writer_finished)
                         self.writer.start()
                         self.poll_timer.start(100)
+                        if self._level2_preview:
+                            self.preview_timer.start(66)
                         self.scroll_timer.start()
                         event.ignore()
                         return
@@ -530,7 +580,11 @@ class InvisibleTeleprompter(QMainWindow):
                     offer(self.commands, {"type": "ERROR", "message": "No se pudieron guardar los ajustes finales del teleprompter."})
                     self.writer.discard_unsaved()
         self.poll_timer.stop()
+        self.preview_timer.stop()
         self.scroll_timer.stop()
+        if self._preview_shm is not None:
+            self._preview_shm.close()
+            self._preview_shm = None
         QApplication.instance().removeEventFilter(self)
         for identifier in self._hotkeys:
             self.user32.UnregisterHotKey(int(self.winId()), identifier)
@@ -542,9 +596,11 @@ class InvisibleTeleprompter(QMainWindow):
 
 
 def run_teleprompter_process(commands=None, events=None, previews=None, stop=None,
-                             script_path=None, settings=None, eye_mode=False):
+                             script_path=None, settings=None, eye_mode=False, shm_name=None):
     app = QApplication([sys.argv[0]])
-    window = InvisibleTeleprompter(commands, events, previews, stop, script_path, settings, eye_mode)
+    window = InvisibleTeleprompter(
+        commands, events, previews, stop, script_path, settings, eye_mode, shm_name=shm_name,
+    )
     window.show()
     sys.exit(app.exec())
 
