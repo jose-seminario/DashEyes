@@ -25,6 +25,7 @@ a = Analysis(
     hiddenimports=[
         'main', 'diagnostics', 'teleprompter_ui', 'video_worker', 'eye_contact',
         'config_manager', 'protocol', 'runtime', 'settings_writer',
+        'shared_buffer', 'multiprocessing.shared_memory',
         'mediapipe.python.solutions.face_mesh',
         'mediapipe.python._framework_bindings',
     ],

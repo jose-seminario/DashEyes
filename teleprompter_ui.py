@@ -41,6 +41,7 @@ class InvisibleTeleprompter(QMainWindow):
         self.config = config_manager.normalize_config(settings or config_manager.load_config())
         self._preview_shm = None
         self._last_shm_seq = 0
+        self._preview_stale = False
         if self.eye_mode and shm_name and config_manager.level2_preview_enabled(self.config):
             try:
                 from shared_buffer import SharedPreviewBuffer
@@ -372,6 +373,11 @@ class InvisibleTeleprompter(QMainWindow):
                 )
             elif kind in ("WARNING", "ERROR", "READY"):
                 self.status_label.setText(message.get("message", ""))
+                if kind == "ERROR":
+                    self.preview_timer.stop()
+                    if self._preview_shm is not None:
+                        self._preview_shm.close()
+                        self._preview_shm = None
                 if kind == "WARNING" and message.get("reconcile"):
                     self._pending_intensity = None
                     self._pending_enabled = None
@@ -390,22 +396,31 @@ class InvisibleTeleprompter(QMainWindow):
         if self._closing or self._preview_shm is None or not self.preview_container.isVisible():
             return
         if self.stop is not None and self.stop.is_set():
+            self.preview_timer.stop()
             return
         status, seq, payload = self._preview_shm.read_latest(self._last_shm_seq, max_age=1.5)
+        if status == "CLOSED":
+            self.preview_timer.stop()
+            self._preview_shm.close()
+            self._preview_shm = None
+            return
         if status == "OK" and payload is not None:
             self._last_shm_seq = seq
+            self._preview_stale = False
             width, height, raw = payload
-            qimage = QImage(raw, width, height, width * 3, QImage.Format.Format_RGB888).copy()
+            qimage = QImage(raw, width, height, width * 3, QImage.Format.Format_RGB888)
             if not qimage.isNull():
                 pixmap = QPixmap.fromImage(qimage)
-                self.preview_label.setPixmap(
-                    pixmap.scaled(
-                        self.preview_label.size(),
+                target = self.preview_label.size()
+                if width > target.width() or height > target.height():
+                    pixmap = pixmap.scaled(
+                        target,
                         Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
+                        Qt.TransformationMode.FastTransformation,
                     )
-                )
-        elif status == "STALE":
+                self.preview_label.setPixmap(pixmap)
+        elif status == "STALE" and not self._preview_stale:
+            self._preview_stale = True
             self.preview_label.setPixmap(QPixmap())
             self.preview_label.setText("Sin señal de cámara (1.5 s)…")
 
