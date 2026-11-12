@@ -22,6 +22,7 @@ except ImportError:
 
 DEFAULT_CONFIG = {
     "enable_level1_controls": True,
+    "enable_level2_preview": False,
     "eye_contact": {"enabled": True, "intensity": 35},
     "teleprompter": {
         "scroll_speed": 3, "font_size": 24, "opacity": 215,
@@ -76,9 +77,10 @@ def normalize_config(data):
     result = copy.deepcopy(DEFAULT_CONFIG)
     if not isinstance(data, dict):
         return result
-    flag = data.get("enable_level1_controls")
-    if isinstance(flag, bool):
-        result["enable_level1_controls"] = flag
+    for flag_name in ("enable_level1_controls", "enable_level2_preview"):
+        flag = data.get(flag_name)
+        if isinstance(flag, bool):
+            result[flag_name] = flag
     for section in ("eye_contact", "teleprompter", "video"):
         supplied = data.get(section)
         if not isinstance(supplied, dict):
@@ -110,6 +112,12 @@ def level1_controls_enabled(data=None):
     """Indica si los controles manuales de nivel 1 están habilitados en la configuración."""
     source = normalize_config(data) if isinstance(data, dict) else load_config()
     return bool(source.get("enable_level1_controls", True))
+
+
+def level2_preview_enabled(data=None):
+    """Indica si la vista previa en memoria compartida de nivel 2 está habilitada."""
+    source = normalize_config(data) if isinstance(data, dict) else load_config()
+    return bool(source.get("enable_level2_preview", False))
 
 
 @contextmanager
