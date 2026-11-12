@@ -511,7 +511,9 @@ class InvisibleTeleprompter(QMainWindow):
                     elif clicked == cancel_btn or (clicked == retry_btn and self.writer.has_unsaved_changes()):
                         self._closing = False
                         self.centralWidget().setEnabled(True)
+                        old_writer = self.writer
                         self.writer = SettingsWriter(self)
+                        self.writer.adopt_unsaved(old_writer)
                         self.writer.saved.connect(self._settings_saved)
                         self.writer.finished.connect(self._writer_finished)
                         self.writer.start()

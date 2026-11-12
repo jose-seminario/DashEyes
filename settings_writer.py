@@ -22,6 +22,7 @@ class SettingsWriter(QThread):
         self.idle_event.set()
         self._unsaved_batch = {}
         self.last_error = ""
+        self._discard_epoch = 0
 
     @staticmethod
     def _merge_patch(target, patch):
@@ -32,6 +33,23 @@ class SettingsWriter(QThread):
                 target[section] = copy.deepcopy(values)
             else:
                 target[section] = values
+
+    def adopt_unsaved(self, other):
+        if other is None:
+            return
+        with other.state_lock:
+            unsaved = copy.deepcopy(other._unsaved_batch)
+            while True:
+                try:
+                    patch = other.pending.get_nowait()
+                    self._merge_patch(unsaved, patch)
+                except queue.Empty:
+                    break
+            error = other.last_error
+        if unsaved:
+            with self.state_lock:
+                self._merge_patch(self._unsaved_batch, unsaved)
+                self.last_error = error
 
     def submit(self, patch):
         with self.state_lock:
@@ -50,6 +68,7 @@ class SettingsWriter(QThread):
 
     def discard_unsaved(self):
         with self.state_lock:
+            self._discard_epoch += 1
             while True:
                 try:
                     self.pending.get_nowait()
@@ -69,6 +88,7 @@ class SettingsWriter(QThread):
                 except queue.Empty:
                     break
             batch = copy.deepcopy(self._unsaved_batch)
+            epoch = self._discard_epoch
         if not batch:
             with self.state_lock:
                 self.last_error = ""
@@ -78,8 +98,9 @@ class SettingsWriter(QThread):
         try:
             config_manager.update_config(batch)
             with self.state_lock:
-                self._unsaved_batch.clear()
-                self.last_error = ""
+                if self._discard_epoch == epoch:
+                    self._unsaved_batch.clear()
+                    self.last_error = ""
                 if self.pending.empty():
                     self.idle_event.set()
             self.saved.emit(True, "Ajustes guardados")
@@ -87,7 +108,10 @@ class SettingsWriter(QThread):
             return True
         except config_manager.ConfigError as exc:
             with self.state_lock:
-                self.last_error = str(exc)
+                if self._discard_epoch == epoch:
+                    self.last_error = str(exc)
+                if self.pending.empty():
+                    self.idle_event.set()
             self.saved.emit(False, str(exc))
             return False
 
@@ -96,24 +120,26 @@ class SettingsWriter(QThread):
             self.finishing.set()
 
     def run(self):
-        batch = {}
-        retry_at = 0.0
         while True:
             try:
                 patch = self.pending.get(timeout=0.05)
             except queue.Empty:
-                if batch and (self.finishing.is_set() or time.monotonic() >= retry_at):
-                    patch = {}
-                elif self.finishing.is_set():
+                if self.finishing.is_set():
                     with self.state_lock:
-                        if not batch and self.pending.empty() and not self._unsaved_batch:
-                            self.idle_event.set()
-                    return
+                        has_unsaved = bool(self._unsaved_batch)
+                    if has_unsaved:
+                        patch = {}
+                    else:
+                        with self.state_lock:
+                            if self.pending.empty():
+                                self.idle_event.set()
+                        return
                 else:
                     continue
             deadline = time.monotonic() + 0.3
+            incoming = {}
             while True:
-                self._merge_patch(batch, patch)
+                self._merge_patch(incoming, patch)
                 try:
                     if self.finishing.is_set():
                         patch = self.pending.get_nowait()
@@ -126,13 +152,20 @@ class SettingsWriter(QThread):
                     if self.finishing.is_set() or time.monotonic() >= deadline:
                         break
             with self.state_lock:
-                self._unsaved_batch = copy.deepcopy(batch)
+                self._merge_patch(self._unsaved_batch, incoming)
+                batch = copy.deepcopy(self._unsaved_batch)
+                epoch = self._discard_epoch
+            if not batch:
+                with self.state_lock:
+                    if self.pending.empty():
+                        self.idle_event.set()
+                continue
             try:
                 config_manager.update_config(batch)
-                batch = {}
                 with self.state_lock:
-                    self._unsaved_batch.clear()
-                    self.last_error = ""
+                    if self._discard_epoch == epoch:
+                        self._unsaved_batch.clear()
+                        self.last_error = ""
                     is_idle = self.pending.empty()
                     if is_idle:
                         self.idle_event.set()
@@ -141,9 +174,10 @@ class SettingsWriter(QThread):
                     self.idle.emit()
             except config_manager.ConfigError as exc:
                 with self.state_lock:
-                    self.last_error = str(exc)
-                    self._unsaved_batch = copy.deepcopy(batch)
+                    if self._discard_epoch == epoch:
+                        self.last_error = str(exc)
+                    if self.pending.empty():
+                        self.idle_event.set()
                 self.saved.emit(False, str(exc))
-                retry_at = time.monotonic() + 1
                 if self.finishing.is_set():
                     return

@@ -236,8 +236,6 @@ class DashEyesDashboard(QMainWindow):
             if self._pending_mode is not None:
                 self._pending_mode = None
                 self.status_label.setText("No se inició la sesión porque quedan ajustes sin guardar.")
-            if not self._exiting:
-                self.writer.discard_unsaved()
             self._refresh_controls()
 
     def _start_pending(self):
@@ -366,6 +364,10 @@ class DashEyesDashboard(QMainWindow):
             self.status_label.setText("Guardando ajustes antes de iniciar…")
             self._refresh_controls()
             return
+        if self.writer.has_unsaved_changes() and not self.writer.flush_sync():
+            self.status_label.setText("No se inició la sesión porque quedan ajustes sin guardar.")
+            self._refresh_controls()
+            return
         arguments = ["--mode", mode, "--dashboard"]
         if self.selected_script_path:
             arguments += ["--script", self.selected_script_path]
@@ -479,7 +481,9 @@ class DashEyesDashboard(QMainWindow):
                         pass
                     elif clicked == cancel_btn or (clicked == retry_btn and self.writer.has_unsaved_changes()):
                         self._exiting = False
+                        old_writer = self.writer
                         self.writer = SettingsWriter(self)
+                        self.writer.adopt_unsaved(old_writer)
                         self.writer.saved.connect(self._settings_saved)
                         self.writer.idle.connect(self._start_pending)
                         self.writer.start()
