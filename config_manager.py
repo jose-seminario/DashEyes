@@ -22,7 +22,7 @@ except ImportError:
 
 DEFAULT_CONFIG = {
     "enable_level1_controls": True,
-    "enable_level2_preview": False,
+    "enable_level2_preview": True,
     "eye_contact": {"enabled": True, "intensity": 35},
     "teleprompter": {
         "scroll_speed": 3, "font_size": 24, "opacity": 215,
@@ -117,7 +117,7 @@ def level1_controls_enabled(data=None):
 def level2_preview_enabled(data=None):
     """Indica si la vista previa en memoria compartida de nivel 2 está habilitada."""
     source = normalize_config(data) if isinstance(data, dict) else load_config()
-    return bool(source.get("enable_level2_preview", False))
+    return bool(source.get("enable_level2_preview", True))
 
 
 @contextmanager

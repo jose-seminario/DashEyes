@@ -156,6 +156,8 @@ class DashEyesDashboard(QMainWindow):
         calibration.addWidget(self.intensity_slider)
         self.toggle_checkbox = QCheckBox("Habilitar corrección (requiere calibrar en cada sesión)")
         calibration.addWidget(self.toggle_checkbox)
+        self.preview_level2_checkbox = QCheckBox("Mostrar Vista Previa (Preview)")
+        calibration.addWidget(self.preview_level2_checkbox)
         layout.addWidget(self.calibration_frame)
         self.launch_teleprompter_btn = QPushButton("Iniciar Teleprompter — sin cámara")
         self.launch_teleprompter_btn.clicked.connect(lambda: self._launch("teleprompter"))
@@ -185,6 +187,7 @@ class DashEyesDashboard(QMainWindow):
         self.setCentralWidget(scroll)
         self.intensity_slider.valueChanged.connect(self._controls_changed)
         self.toggle_checkbox.toggled.connect(self._controls_changed)
+        self.preview_level2_checkbox.toggled.connect(self._controls_changed)
         self.camera_index.valueChanged.connect(self._controls_changed)
         self.profile.currentIndexChanged.connect(self._controls_changed)
 
@@ -208,11 +211,15 @@ class DashEyesDashboard(QMainWindow):
     def _load_controls(self):
         config = config_manager.load_config()
         self._level1_enabled = config_manager.level1_controls_enabled(config)
-        controls = (self.intensity_slider, self.toggle_checkbox, self.camera_index, self.profile)
+        controls = (
+            self.intensity_slider, self.toggle_checkbox, self.preview_level2_checkbox,
+            self.camera_index, self.profile,
+        )
         for control in controls:
             control.blockSignals(True)
         self.intensity_slider.setValue(config["eye_contact"]["intensity"])
         self.toggle_checkbox.setChecked(config["eye_contact"]["enabled"])
+        self.preview_level2_checkbox.setChecked(config_manager.level2_preview_enabled(config))
         self.camera_index.setValue(config["video"]["camera_index"])
         self.profile.setCurrentIndex(self.profile.findData(config["video"]["profile"]))
         for control in controls:
@@ -225,6 +232,7 @@ class DashEyesDashboard(QMainWindow):
     def _controls_changed(self, *_):
         self.intensity_label.setText(f"Intensidad máxima: {self.intensity_slider.value()}%")
         self.writer.submit({
+            "enable_level2_preview": self.preview_level2_checkbox.isChecked(),
             "eye_contact": {"intensity": self.intensity_slider.value(), "enabled": self.toggle_checkbox.isChecked()},
             "video": {"camera_index": self.camera_index.value(), "profile": self.profile.currentData()},
         })
