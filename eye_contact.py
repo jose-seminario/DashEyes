@@ -21,6 +21,19 @@ CANONICAL_FACE_3D = np.array([
 ], dtype=np.float64)
 
 
+def _normalized_sigmoid_falloff(value, low, high, steepness=0.45):
+    """Curva logística suave entre 1.0 (<= low) y 0.0 (>= high), estilo NVIDIA AR gating."""
+    if value <= low:
+        return 1.0
+    if value >= high:
+        return 0.0
+    midpoint = 0.5 * (low + high)
+    raw = 1.0 / (1.0 + math.exp(steepness * (value - midpoint)))
+    high_val = 1.0 / (1.0 + math.exp(steepness * (low - midpoint)))
+    low_val = 1.0 / (1.0 + math.exp(steepness * (high - midpoint)))
+    return float(np.clip((raw - low_val) / max(1e-6, high_val - low_val), 0.0, 1.0))
+
+
 def pose_estimate(points, width, height):
     """Retorna rotación y ángulos, o None. Una estimación fallida nunca habilita el efecto."""
     image = np.asarray(points, dtype=np.float64)
@@ -49,9 +62,20 @@ def pose_estimate(points, width, height):
 def pose_gate(angles):
     if not np.isfinite(angles).all():
         return 0.0
-    # No plegar 180° a 0°: son poses distintas.
+    # No plegar 180° a 0°: son poses distintas. Transición sigmoidea suave entre 12° y 24°.
     largest = max(abs(float(angle)) for angle in angles)
-    return float(np.clip((24 - largest) / 12, 0, 1))
+    return _normalized_sigmoid_falloff(largest, 12.0, 24.0, steepness=0.45)
+
+
+def dynamic_gaze_gate(errors):
+    """Atenuación sigmoidea externa y coherencia binocular para evitar mirada forzada."""
+    max_err = float(np.max(np.abs(errors)))
+    disparity = float(np.linalg.norm(errors[0] - errors[1]))
+    if max_err > 0.18 or disparity > 0.085:
+        return 0.0
+    outer_gate = _normalized_sigmoid_falloff(max_err, 0.11, 0.18, steepness=85.0)
+    disparity_gate = _normalized_sigmoid_falloff(disparity, 0.045, 0.085, steepness=140.0)
+    return float(outer_gate * disparity_gate)
 
 
 class EyeContactEngine:
@@ -69,12 +93,52 @@ class EyeContactEngine:
         self.offsets = np.zeros((2, 2), dtype=np.float32)
         self.last_time = None
         self.last_centers = None
+        self.last_gate = 1.0
+        self._saccade_vec = np.zeros(2, dtype=np.float32)
+        self._saccade_start = 0.0
+        self._saccade_end = 0.0
+        self._next_saccade_at = 0.0
+        self._saccade_step = 0
         self._grids = {}
 
     def reset_tracking(self):
         self.offsets.fill(0)
         self.last_time = None
         self.last_centers = None
+        self.last_gate = 1.0
+        self._saccade_vec.fill(0)
+        self._saccade_start = 0.0
+        self._saccade_end = 0.0
+        self._next_saccade_at = 0.0
+
+    def _physiological_micro_motion(self, now, active_weight):
+        """Deriva lenta + micro-sacadas elípticas conjugadas (modelo de Engbert)."""
+        if active_weight <= 0.05:
+            self._saccade_vec.fill(0)
+            return np.zeros(2, dtype=np.float32)
+        # Deriva basal continua con predominio horizontal 2:1 (elipse de velocidades de Engbert).
+        drift_x = 0.0014 * math.sin(now * 2.3) + 0.0008 * math.cos(now * 3.7)
+        drift_y = 0.0007 * math.sin(now * 1.9 + 0.8)
+        pulse = np.zeros(2, dtype=np.float32)
+        if self._next_saccade_at <= 0.0:
+            self._next_saccade_at = now + 1.1
+        elif now >= self._next_saccade_at:
+            self._saccade_step += 1
+            # Secuencia determinista de baja discrepancia: evita estado global de RNG y es reproducible.
+            angle = (self._saccade_step * 2.399963229728653) % (2.0 * math.pi)
+            # Elipse de Engbert: semieje horizontal mayor que el vertical.
+            self._saccade_vec[0] = float(0.0032 * math.cos(angle))
+            self._saccade_vec[1] = float(0.0016 * math.sin(angle))
+            self._saccade_start = now
+            self._saccade_end = now + 0.14
+            interval = 1.0 + 0.9 * abs(math.sin(self._saccade_step * 1.6180339887))
+            self._next_saccade_at = self._saccade_end + interval
+        if self._saccade_start < now < self._saccade_end:
+            phase = (now - self._saccade_start) / max(1e-4, self._saccade_end - self._saccade_start)
+            # Perfil balístico suave de ida y retorno (0 -> 1 -> 0).
+            envelope = math.sin(math.pi * phase) ** 2
+            pulse = self._saccade_vec * float(envelope)
+        return (np.array([drift_x, drift_y], dtype=np.float32) + pulse) * float(active_weight)
 
     def start_calibration(self):
         self.reset_calibration()
@@ -193,20 +257,35 @@ class EyeContactEngine:
                 self.reset_calibration()
                 return self.bypass(frame, "UNCALIBRATED", "Posición o sujeto cambió; vuelve a calibrar.")
         errors = self.baseline - gaze
-        if np.max(np.abs(errors)) > 0.16 or np.linalg.norm(errors[0] - errors[1]) > 0.08:
+        gaze_gate = dynamic_gaze_gate(errors)
+        if gaze_gate <= 0.0:
             return self.bypass(frame, "UNCERTAIN", "Desviación grande o inconsistente; vídeo original.")
-        # Zona muerta: no tocar ojos que ya miran cerca del objetivo.
-        target = np.sign(errors) * np.maximum(np.abs(errors) - 0.015, 0)
+        combined_gate = float(gate * gaze_gate)
+        # Zona muerta interna con rampa sigmoidea suave para no tocar ojos que ya miran al objetivo.
+        abs_err = np.abs(errors)
+        excess = np.maximum(abs_err - 0.015, 0.0)
+        inner_smooth = excess / (excess + 0.004)
+        target = np.sign(errors) * excess * np.where(excess > 0.0, inner_smooth, 0.0)
         target = np.clip(target, [-0.025, -0.045], [0.025, 0.045])
-        target *= self.intensity / 100.0 * gate
+        target *= (self.intensity / 100.0) * combined_gate
+        now = time.monotonic()
+        # Inyectar micro-sacadas conjugadas solo cuando existe corrección efectiva fuera de la zona muerta.
+        active_strength = float(np.clip(np.max(np.abs(target)) / 0.012, 0.0, 1.0)) * combined_gate
+        if active_strength > 0.05:
+            micro = self._physiological_micro_motion(now, active_strength * (self.intensity / 100.0))
+            target = target + micro[None, :]
+        else:
+            self._saccade_vec.fill(0)
         centers = np.array([eye["iris"] for eye in eyes]) / [width, height]
         if self.last_centers is not None and np.max(np.abs(centers - self.last_centers)) > 0.08:
             self.reset_tracking()
         self.last_centers = centers
-        now = time.monotonic()
         dt = 1 / 30 if self.last_time is None else min(now - self.last_time, 0.1)
         self.last_time = now
-        alpha = 1 - math.exp(-dt / 0.12)
+        # Amortiguación adaptativa: retorno más rápido si la compuerta cae por giro de cabeza.
+        tau = 0.045 if combined_gate < self.last_gate - 0.05 else 0.12
+        self.last_gate = combined_gate
+        alpha = 1 - math.exp(-dt / tau)
         self.offsets += alpha * (target - self.offsets)
         changed = False
         for index, eye in enumerate(eyes):
@@ -216,6 +295,29 @@ class EyeContactEngine:
         self.current_state = "CORRECTING" if changed else "NATURAL"
         self.message = "Corrección sutil aplicada." if changed else "Mirada cerca del objetivo; sin corrección."
         return frame
+
+    @staticmethod
+    def _extract_specular_layer(crop, interior, radial):
+        """Extrae reflejos corneales reales (LCM); retorna None en baja luz o sin reflejo."""
+        valid = interior > 0
+        if not np.any(valid):
+            return None
+        c_max = np.max(crop, axis=2).astype(np.float32)
+        c_min = np.min(crop, axis=2).astype(np.float32)
+        interior_vals = c_max[valid]
+        median_lum = float(np.median(interior_vals))
+        # Doble guarda física: brillo absoluto alto (>= 185) y contraste claro sobre el fondo ocular (+38).
+        threshold = max(185.0, median_lum + 38.0, float(np.percentile(interior_vals, 93)))
+        chroma = c_max - c_min
+        spec_candidates = (c_max >= threshold) & (chroma <= 75.0) & valid & (radial > 0.15)
+        if not np.any(spec_candidates):
+            return None
+        strength = np.clip((c_max - threshold) / max(12.0, 255.0 - threshold), 0.0, 1.0)
+        spec_weight = np.where(spec_candidates, strength * radial, 0.0).astype(np.float32)
+        spec_weight = cv2.GaussianBlur(spec_weight, (3, 3), 0) * interior.astype(np.float32)
+        if float(np.max(spec_weight)) < 0.05:
+            return None
+        return spec_weight[..., None], crop.astype(np.float32)
 
     def _deform_eye(self, frame, eye, offset):
         height, width = frame.shape[:2]
@@ -246,6 +348,14 @@ class EyeContactEngine:
         active = mask > 0.01
         if not np.any(active) or float(np.linalg.norm(offset) * np.max(mask)) < 0.05:
             return False
+        specular = self._extract_specular_layer(crop, interior, radial)
+        source_crop = crop
+        if specular is not None:
+            spec_weight, orig_float = specular
+            # Suavizar el pico especular antes del remap para no arrastrar un reflejo duplicado.
+            local_blur = cv2.GaussianBlur(crop, (5, 5), 0).astype(np.float32)
+            dampened = orig_float * (1.0 - 0.65 * spec_weight) + local_blur * (0.65 * spec_weight)
+            source_crop = np.clip(np.rint(dampened), 0, 255).astype(np.uint8)
         map_x = grid_x - offset[0] * mask
         map_y = grid_y - offset[1] * mask
         src_x = np.clip(np.rint(map_x).astype(np.int32), 0, w - 1)
@@ -255,11 +365,16 @@ class EyeContactEngine:
             map_x = np.where(outside_src, grid_x, map_x)
             map_y = np.where(outside_src, grid_y, map_y)
         shifted = cv2.remap(
-            crop, map_x, map_y,
+            source_crop, map_x, map_y,
             cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101,
         )
         # Escribir solo dentro del ojo; fuera de él se conserva cada byte.
         feather = edge.astype(np.float32)[..., None]
-        blended = np.rint(shifted * feather + crop * (1 - feather))
-        crop[active] = np.clip(blended[active], 0, 255).astype(np.uint8)
+        blended = shifted.astype(np.float32) * feather + crop.astype(np.float32) * (1.0 - feather)
+        if specular is not None:
+            # Re-inyección estacionaria del reflejo especular corneal en sus coordenadas originales (LCM).
+            spec_weight, orig_float = specular
+            stationary_weight = spec_weight * feather
+            blended = blended * (1.0 - stationary_weight) + orig_float * stationary_weight
+        crop[active] = np.clip(np.rint(blended[active]), 0, 255).astype(np.uint8)
         return True
