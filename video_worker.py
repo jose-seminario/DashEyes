@@ -122,11 +122,18 @@ def fit_frame_to_output(captured, output_size):
     return canvas
 
 
-def run_video_worker(commands, events, previews, stop, settings):
+def run_video_worker(commands, events, previews, stop, settings, shm_name=None):
     logger = get_logger("video")
-    grabber = face_mesh = virtual = None
+    grabber = face_mesh = virtual = preview_shm = None
     try:
         import pyvirtualcam
+        if shm_name and config_manager.level2_preview_enabled(settings):
+            try:
+                from shared_buffer import SharedPreviewBuffer
+                preview_shm = SharedPreviewBuffer.attach(shm_name)
+            except Exception:
+                logger.warning("No se pudo adjuntar la memoria compartida de vista previa.", exc_info=True)
+                preview_shm = None
         factory = require_face_mesh()
         profile = config_manager.PROFILES[settings["video"]["profile"]]
         cv2.setNumThreads(1)
@@ -208,7 +215,9 @@ def run_video_worker(commands, events, previews, stop, settings):
                 engine.reset_calibration()
                 offer_latest(events, {"type": "WARNING", "message": "Cambió el formato de la cámara; vuelve a calibrar."})
             frame = fit_frame_to_output(captured, output_size)
-            original = frame.copy() if want_preview and now - last_preview >= 0.2 else None
+            preview_interval = (1.0 / 15.0) if preview_shm is not None else 0.2
+            due_preview = (now - last_preview) >= preview_interval
+            original = frame.copy() if (want_preview and due_preview) else None
             processing_start = time.monotonic()
             need_tracking = (engine.correction_enabled and engine.intensity > 0) or engine.calibration_deadline is not None
             landmarks = None
@@ -233,6 +242,9 @@ def run_video_worker(commands, events, previews, stop, settings):
             else:
                 slow_frames = max(0, slow_frames - 1)
             virtual.send(frame)
+            if preview_shm is not None and due_preview:
+                preview_shm.write_bgr_frame(frame, original_bgr=original, now=now)
+                last_preview = now
             virtual.sleep_until_next_frame()
             last_output = frame
             count += 1
@@ -246,7 +258,7 @@ def run_video_worker(commands, events, previews, stop, settings):
                                       "processing_ms": round(processing_ms, 1), "detection_width": detection_width,
                                       "intensity": engine.intensity, "enabled": engine.correction_enabled})
                 last_status = now
-            if original is not None:
+            if preview_shm is None and original is not None:
                 h = 150
                 w = max(2, int(h * output_size[0] / output_size[1]))
                 comparison = np.hstack((cv2.resize(original, (w, h)), cv2.resize(frame, (w, h))))
@@ -259,6 +271,8 @@ def run_video_worker(commands, events, previews, stop, settings):
         offer(events, {"type": "ERROR", "message": str(exc)})
         raise
     finally:
+        if preview_shm is not None:
+            preview_shm.close()
         if grabber is not None and not grabber.stop():
             logger.warning("Captura bloqueada; el proceso liberará el recurso al terminar.")
         for resource in (face_mesh, virtual):
