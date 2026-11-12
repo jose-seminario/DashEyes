@@ -50,7 +50,7 @@ def emit(message):
             pass
 
 
-def _run_video(commands, events, previews, stop, settings):
+def _run_video(commands, events, previews, stop, settings, shm_name=None):
     logger = get_logger("video")
     previews.cancel_join_thread()
     try:
@@ -60,18 +60,18 @@ def _run_video(commands, events, previews, stop, settings):
             logger.exception("No se pudo importar el motor")
             offer(events, {"type": "ERROR", "message": "No se pudo cargar el motor. Revisa las dependencias y el registro local."})
             raise
-        run_video_worker(commands, events, previews, stop, settings)
+        run_video_worker(commands, events, previews, stop, settings, shm_name=shm_name)
     finally:
         # El padre drena esta cola también durante el cierre.
         events.close()
         events.join_thread()
 
 
-def _run_ui(commands, events, previews, stop, script, settings, eye_mode):
+def _run_ui(commands, events, previews, stop, script, settings, eye_mode, shm_name=None):
     commands.cancel_join_thread()
     try:
         from teleprompter_ui import run_teleprompter_process
-        run_teleprompter_process(commands, events, previews, stop, script, settings, eye_mode)
+        run_teleprompter_process(commands, events, previews, stop, script, settings, eye_mode, shm_name=shm_name)
     except Exception:
         get_logger("teleprompter").exception("Error de interfaz")
         offer(commands, {"type": "ERROR", "message": "No se pudo abrir el teleprompter. Revisa las dependencias de interfaz."})
@@ -119,6 +119,8 @@ def supervise(args):
     channels = (ui_commands, video_commands, video_events, ui_events, previews)
     processes = []
     job = None
+    preview_shm = None
+    shm_name = None
     exit_code = 0
     emitted_error = False
     settings = config_manager.load_config()
@@ -143,9 +145,18 @@ def supervise(args):
         job = ProcessJob()
         if args.dashboard:
             threading.Thread(target=_read_dashboard, args=(incoming, stop), daemon=True).start()
+        if eye_mode and config_manager.level2_preview_enabled(settings):
+            try:
+                from shared_buffer import SharedPreviewBuffer
+                preview_shm = SharedPreviewBuffer.create()
+                shm_name = preview_shm.name
+            except Exception:
+                logger.warning("No se pudo reservar memoria compartida de Nivel 2; usando modo estándar.", exc_info=True)
+                preview_shm = None
+                shm_name = None
         if eye_mode:
             video = context.Process(
-                target=_run_video, args=(video_commands, video_events, previews, stop, settings),
+                target=_run_video, args=(video_commands, video_events, previews, stop, settings, shm_name),
                 name="DashEyes-Video",
             )
             video.start()
@@ -153,7 +164,7 @@ def supervise(args):
             job.add(video)
         ui = context.Process(
             target=_run_ui,
-            args=(ui_commands, ui_events, previews, stop, args.script, settings, eye_mode),
+            args=(ui_commands, ui_events, previews, stop, args.script, settings, eye_mode, shm_name),
             name="DashEyes-Teleprompter",
         )
         ui.start()
@@ -268,6 +279,8 @@ def supervise(args):
         for process in processes:
             if not process.is_alive():
                 process.close()
+        if preview_shm is not None:
+            preview_shm.close()
         emit({"type": "STOPPED", "exit_code": exit_code})
     return exit_code
 
